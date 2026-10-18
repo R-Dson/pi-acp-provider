@@ -36,7 +36,7 @@ function makeProvider(
 	agents: AcpAgentConfig[] = [fakeAgent()],
 	extra: Omit<AcpProviderOptions, "config"> = {},
 ): AcpProviderHandle {
-	const handle = createAcpProvider({ config: { agents, autoApproveTools: true, handshakeTimeoutMs: 8000 }, ...extra });
+	const handle = createAcpProvider({ config: { agents, autoApproveTools: true, handshakeTimeoutMs: 8000, debug: false }, ...extra });
 	handles.push(handle);
 	return handle;
 }
@@ -116,6 +116,21 @@ test("agents run as separate processes with separate sessions", async () => {
 	assert.match(messageText(first.message), /#0/);
 	assert.match(messageText(second.message), /#0/);
 	assert.equal(second.message.model, "other");
+});
+
+test("a tool call reported already completed renders its result", async () => {
+	const handle = makeProvider();
+	const last = await lastEvent(handle, "ONESHOT go");
+	assert.ok(last?.type === "done");
+	assert.match(messageText(last.message), /⚙️ Executing \[read notes\]\.\.\.\n✓ read notes: 2 notes\n/);
+});
+
+test("agentFor resolves bare and agent/model ids to their agent", () => {
+	const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+	assert.equal(handle.agentFor("fake"), "fake");
+	assert.equal(handle.agentFor("other/smart"), "other");
+	assert.equal(handle.agentFor("ghost/smart"), undefined);
+	assert.equal(handle.agentFor("fakeish"), undefined);
 });
 
 test("a model id without a configured agent fails cleanly", async () => {
@@ -312,6 +327,21 @@ test("picking a discovered model and thinking level switches the session", async
 	const back = await lastEvent(handle, "again", firstModel(handle));
 	assert.ok(back?.type === "done");
 	assert.match(messageText(back.message), /\[model=fast thought=none\]/);
+});
+
+test("each agent's bare model keeps its own session default, even when session ids collide", async () => {
+	const handle = makeProvider([
+		fakeAgent({ env: { FAKE_MODELS: "config", FAKE_DEFAULT_MODEL: "smart" } }),
+		fakeAgent({ id: "other", name: "Other agent", env: { FAKE_MODELS: "config" } }),
+	]);
+	const [fake, other] = handle.provider.getModels();
+	assert.ok(fake && other);
+	// Both fake processes name their first session `sess-1`.
+	const first = await lastEvent(handle, "hi", fake);
+	const second = await lastEvent(handle, "hi", other);
+	assert.ok(first?.type === "done" && second?.type === "done");
+	assert.match(messageText(first.message), /\[model=smart /);
+	assert.match(messageText(second.message), /\[model=fast /);
 });
 
 test("legacy models API is discovered and switched with session/set_model", async () => {

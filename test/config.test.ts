@@ -7,6 +7,7 @@ test("defaults apply when nothing is configured", () => {
 		agents: [],
 		autoApproveTools: true,
 		handshakeTimeoutMs: 30_000,
+		debug: false,
 	});
 });
 
@@ -27,8 +28,9 @@ test("agents resolve with defaults for optional fields", () => {
 });
 
 test("environment overrides settings", () => {
-	const config = resolveConfig({ settings: { autoApproveTools: true }, env: { ACP_AUTO_APPROVE: "false" } });
+	const config = resolveConfig({ settings: { autoApproveTools: true }, env: { ACP_AUTO_APPROVE: "false", ACP_DEBUG: "TRUE" } });
 	assert.equal(config.autoApproveTools, false);
+	assert.equal(config.debug, true);
 });
 
 test("invalid settings values and agents are dropped", () => {

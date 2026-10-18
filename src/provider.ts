@@ -29,17 +29,19 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { AcpClient, AcpRpcError, RPC_INVALID_PARAMS, RPC_METHOD_NOT_FOUND, type ServerRequest } from "./acp-client.ts";
+import { AcpClient, AcpRpcError, type ServerRequest } from "./acp-client.ts";
 import {
 	ACP_AUTH_REQUIRED,
+	RPC_INVALID_PARAMS,
+	RPC_METHOD_NOT_FOUND,
 	autoApprove,
+	parsePermissionRequest,
 	type AcpAgentInfo,
 	type AcpCommand,
-	type AcpSelect,
-	type AcpSessionConfig,
-	parsePermissionRequest,
 	type AcpPermissionOutcome,
 	type AcpPermissionRequest,
+	type AcpSelect,
+	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type AcpStopReason,
 } from "./acp.ts";
@@ -64,13 +66,13 @@ function thinkingLevelMap(thoughtLevel: AcpSelect): ThinkingLevelMap {
 	) as ThinkingLevelMap;
 }
 
-function baseModel(id: string, name: string, agent: AcpAgentConfig, thinking: ThinkingLevelMap | undefined): Model<typeof ACP_API> {
+function toModel(agentId: string, id: string, name: string, thinking: ThinkingLevelMap | undefined): Model<typeof ACP_API> {
 	return {
 		id,
 		name,
 		api: ACP_API,
 		provider: ACP_PROVIDER_ID,
-		baseUrl: `stdio://${agent.id}`, // Unused: the transport is a child process.
+		baseUrl: `stdio://${agentId}`, // Unused: the transport is a child process.
 		reasoning: thinking !== undefined,
 		...(thinking ? { thinkingLevelMap: thinking } : {}),
 		input: ["text"],
@@ -81,12 +83,12 @@ function baseModel(id: string, name: string, agent: AcpAgentConfig, thinking: Th
 }
 
 /** The agent's default model, then one model per model its session offers. */
-export function agentModels(agent: AcpAgentConfig, config?: AcpSessionConfig): Model<typeof ACP_API>[] {
+function agentModels(agent: AcpAgentConfig, config?: AcpSessionConfig): Model<typeof ACP_API>[] {
 	const thinking = config?.thoughtLevel && thinkingLevelMap(config.thoughtLevel);
 	return [
-		baseModel(agent.id, agent.name, agent, thinking),
+		toModel(agent.id, agent.id, agent.name, thinking),
 		...(config?.model?.choices ?? []).map((choice) =>
-			baseModel(`${agent.id}/${choice.value}`, `${choice.name} (${agent.name})`, agent, thinking),
+			toModel(agent.id, `${agent.id}/${choice.value}`, `${choice.name} (${agent.name})`, thinking),
 		),
 	];
 }
@@ -127,6 +129,8 @@ export interface AcpProviderHandle {
 	provider: Provider;
 	/** Starts fresh ACP sessions in `cwd` on the next prompt (a new Pi session). */
 	resetSession(cwd: string): void;
+	/** Id of the agent that serves `modelId` (`<agent id>` or `<agent id>/<model id>`), if any. */
+	agentFor(modelId: string): string | undefined;
 	/** Slash commands the agent's current session advertised; empty until it has started. */
 	commands(agentId: string): Promise<AcpCommand[]>;
 	/** Kills all agent processes; the provider respawns them if used again. */
@@ -158,16 +162,13 @@ function summarize(text: string, max = 200): string {
  * open at a time and emits balanced start/delta/end events for it.
  */
 function createMessageWriter(stream: AssistantMessageEventStream, message: AssistantMessage) {
-	let open: { type: "text" | "thinking"; index: number } | null = null;
+	/** The block being streamed and its content so far. */
+	let open: { type: "text" | "thinking"; contentIndex: number; content: string } | null = null;
 
 	const close = (): void => {
 		if (!open) return;
-		const contentIndex = open.index;
-		const block = message.content[contentIndex];
-		if (block?.type === "text") stream.push({ type: "text_end", contentIndex, content: block.text, partial: message });
-		if (block?.type === "thinking") {
-			stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: message });
-		}
+		const { type, contentIndex, content } = open;
+		stream.push({ type: `${type}_end`, contentIndex, content, partial: message });
 		open = null;
 	};
 
@@ -175,48 +176,42 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 		if (!delta) return;
 		if (open?.type !== type) {
 			close();
-			const contentIndex = message.content.length;
-			if (type === "text") {
-				message.content.push({ type: "text", text: "" });
-				stream.push({ type: "text_start", contentIndex, partial: message });
-			} else {
-				message.content.push({ type: "thinking", thinking: "" });
-				stream.push({ type: "thinking_start", contentIndex, partial: message });
-			}
-			open = { type, index: contentIndex };
+			open = { type, contentIndex: message.content.length, content: "" };
+			message.content.push(type === "text" ? { type, text: "" } : { type, thinking: "" });
+			stream.push({ type: `${type}_start`, contentIndex: open.contentIndex, partial: message });
 		}
-		const contentIndex = open.index;
-		const block = message.content[contentIndex];
-		if (block?.type === "text") {
-			block.text += delta;
-			stream.push({ type: "text_delta", contentIndex, delta, partial: message });
-		} else if (block?.type === "thinking") {
-			block.thinking += delta;
-			stream.push({ type: "thinking_delta", contentIndex, delta, partial: message });
-		}
+		open.content += delta;
+		const block = message.content[open.contentIndex];
+		if (block?.type === "text") block.text = open.content;
+		else if (block?.type === "thinking") block.thinking = open.content;
+		stream.push({ type: `${type}_delta`, contentIndex: open.contentIndex, delta, partial: message });
 	};
 
 	let settled = false;
-	const done = (reason: "stop" | "length"): void => {
+	/** Closes the open block and ends the stream; later calls are ignored. */
+	const settle = (push: () => void): void => {
 		if (settled) return;
 		settled = true;
 		close();
-		message.stopReason = reason;
-		stream.push({ type: "done", reason, message });
+		push();
 		stream.end(message);
 	};
-	const fail = (reason: "error" | "aborted", error: string): void => {
-		if (settled) return;
-		settled = true;
-		close();
-		message.stopReason = reason;
-		message.errorMessage = error;
-		stream.push({ type: "error", reason, error: message });
-		stream.end(message);
-	};
+	const done = (reason: "stop" | "length"): void =>
+		settle(() => {
+			message.stopReason = reason;
+			stream.push({ type: "done", reason, message });
+		});
+	const fail = (reason: "error" | "aborted", error: string): void =>
+		settle(() => {
+			message.stopReason = reason;
+			message.errorMessage = error;
+			stream.push({ type: "error", reason, error: message });
+		});
 
 	return { append, done, fail };
 }
+
+type MessageWriter = ReturnType<typeof createMessageWriter>;
 
 /** Renders tool activity as short inline notices in the reply text. */
 function createToolRenderer(append: (text: string) => void) {
@@ -224,10 +219,7 @@ function createToolRenderer(append: (text: string) => void) {
 	return (update: Extract<AcpSessionUpdate, { type: "tool_call" | "tool_call_update" }>): void => {
 		if (update.title) titles.set(update.toolCallId, update.title);
 		const title = titles.get(update.toolCallId) ?? "tool";
-		if (update.type === "tool_call") {
-			append(`\n⚙️ Executing [${title}]...\n`);
-			return;
-		}
+		if (update.type === "tool_call") append(`\n⚙️ Executing [${title}]...\n`);
 		if (update.status !== "completed" && update.status !== "failed") return;
 		const mark = update.status === "completed" ? "✓" : "✗";
 		const summary = summarize(update.summary);
@@ -247,7 +239,31 @@ function authHint(agent: AcpAgentConfig, info: AcpAgentInfo | null): string {
 		: `${agent.name} requires authentication. Sign in with the agent's own CLI, or set "authMethod" for this agent in ~/.pi/agent/settings.json to one of: ${list}.`;
 }
 
+/** Ends the message according to the agent's `stopReason`. */
+function finishTurn(writer: MessageWriter, agent: AcpAgentConfig, stopReason: AcpStopReason): void {
+	switch (stopReason) {
+		case "end_turn":
+			writer.done("stop");
+			return;
+		case "max_tokens":
+		case "max_turn_requests":
+			writer.done("length");
+			return;
+		case "refusal":
+			writer.fail("error", `${agent.name} refused to continue this turn.`);
+			return;
+		case "cancelled":
+			writer.fail("aborted", `${agent.name} cancelled the turn.`);
+			return;
+		default: {
+			const _exhaustive: never = stopReason;
+			void _exhaustive;
+		}
+	}
+}
+
 export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandle {
+	const { log } = options;
 	const policy: PermissionPolicy = options.permissionPolicy ?? (async (request) => autoApprove(request));
 	const agents = new Map(options.config.agents.map((agent) => [agent.id, agent]));
 	/** Each agent's models from discovery (or the persisted catalog); default model only until then. */
@@ -255,10 +271,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const buildModels = () =>
 		options.config.agents.flatMap((agent) => discovered.get(agent.id) ?? agentModels(agent));
 	let models = buildModels();
-	/** Each agent's model when its current session started: what `acp/<agent id>` means. */
-	const sessionDefaults = new Map<string, string | undefined>();
 	let cwd = process.cwd();
-	/** One agent process per model, spawned on first use. */
+	/** One client (and agent process) per agent, spawned on first use. */
 	const clients = new Map<string, AcpClient>();
 
 	const answerServerRequest = async (
@@ -284,7 +298,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				cwd,
 				handshakeTimeoutMs: options.config.handshakeTimeoutMs,
 				onServerRequest: (request) => answerServerRequest(agent, request),
-				log: options.log && ((message) => options.log?.(`${agent.id}: ${message}`)),
+				log: log && ((message) => log(`${agent.id}: ${message}`)),
 			});
 			clients.set(agent.id, client);
 		}
@@ -315,19 +329,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 		const { agent } = target;
-		const acp = getClient(agent);
-		const abortedOrError = (error: unknown): void => {
-			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
-			else if (error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED) {
-				writer.fail("error", authHint(agent, acp.info));
-			} else writer.fail("error", errorMessage(error));
-		};
-
 		const promptText = latestUserPrompt(context.messages);
 		if (promptText === null) {
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
 			return;
 		}
+		const acp = getClient(agent);
+		const abortedOrError = (error: unknown): void => {
+			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
+			else if (error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED) writer.fail("error", authHint(agent, acp.info));
+			else writer.fail("error", errorMessage(error));
+		};
 
 		// Setup failures (spawn, handshake, session) end the stream before `start`.
 		let sessionId: string;
@@ -353,26 +365,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					onProviderStreamEvent &&
 					((params) => {
 						Promise.resolve(onProviderStreamEvent(params, model)).catch((error: unknown) =>
-							options.log?.(`onProviderStreamEvent failed: ${errorMessage(error)}`),
+							log?.(`onProviderStreamEvent failed: ${errorMessage(error)}`),
 						);
 					}),
 				onUpdate: (update) => {
-					switch (update.type) {
-						case "agent_message_chunk":
-							writer.append("text", update.text);
-							return;
-						case "agent_thought_chunk":
-							writer.append("thinking", update.text);
-							return;
-						case "tool_call":
-						case "tool_call_update":
-							renderTool(update);
-							return;
-						default: {
-							const _exhaustive: never = update;
-							void _exhaustive;
-						}
-					}
+					if (update.type === "agent_message_chunk") writer.append("text", update.text);
+					else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
+					else renderTool(update);
 				},
 			});
 			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
@@ -392,18 +391,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		streamOptions: StreamOptions | undefined,
 	): Promise<void> {
 		const signal = streamOptions?.signal;
-		const config = acp.sessionConfig(sessionId);
-		if (!sessionDefaults.has(sessionId)) sessionDefaults.set(sessionId, config?.model?.currentValue);
-		const wantedModel = modelId ?? sessionDefaults.get(sessionId);
-		if (wantedModel !== undefined && config?.model) {
-			if (modelId !== undefined && !config.model.choices.some((choice) => choice.value === modelId)) {
-				const offered = config.model.choices.map((choice) => choice.value).join(", ");
+		const select = acp.sessionConfig(sessionId)?.model;
+		if (modelId !== undefined) {
+			if (!select) throw new Error(`${agent.name} does not support choosing a model over ACP.`);
+			if (!select.choices.some((choice) => choice.value === modelId)) {
+				const offered = select.choices.map((choice) => choice.value).join(", ");
 				throw new Error(`${agent.name} does not offer model '${modelId}'. Available: ${offered || "none"}.`);
 			}
-			await acp.setSessionSetting(sessionId, "model", wantedModel, signal);
-		} else if (modelId !== undefined) {
-			throw new Error(`${agent.name} does not support choosing a model over ACP.`);
 		}
+		// The bare `acp/<agent id>` model means the model the session started with.
+		const wantedModel = modelId ?? acp.initialModel(sessionId);
+		if (select && wantedModel !== undefined) await acp.setSessionSetting(sessionId, "model", wantedModel, signal);
 
 		// Re-read: switching models can change the offered reasoning levels.
 		const thoughtLevel = acp.sessionConfig(sessionId)?.thoughtLevel;
@@ -411,7 +409,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const level: ModelThinkingLevel = (streamOptions as SimpleStreamOptions | undefined)?.reasoning ?? "off";
 		const value = model.thinkingLevelMap?.[level] ?? thinkingLevelMap(thoughtLevel)[level];
 		if (typeof value !== "string" || !thoughtLevel.choices.some((choice) => choice.value === value)) {
-			options.log?.(`${agent.id}: no thought_level value for thinking level '${level}'; keeping the agent's setting`);
+			log?.(`${agent.id}: no thought_level value for thinking level '${level}'; keeping the agent's setting`);
 			return;
 		}
 		await acp.setSessionSetting(sessionId, "thoughtLevel", value, signal);
@@ -421,9 +419,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	async function discoverAgent(agent: AcpAgentConfig, signal: AbortSignal): Promise<void> {
 		const acp = getClient(agent);
 		const sessionId = await acp.ensureSession({ signal, authenticate: false });
-		const config = acp.sessionConfig(sessionId);
-		if (!sessionDefaults.has(sessionId)) sessionDefaults.set(sessionId, config?.model?.currentValue);
-		discovered.set(agent.id, agentModels(agent, config));
+		discovered.set(agent.id, agentModels(agent, acp.sessionConfig(sessionId)));
 	}
 
 	/** Restores the persisted catalog, then rediscovers every agent; failed agents keep their old list. */
@@ -431,14 +427,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const restored = new Map<string, Model<Api>[]>();
 		for (const model of context.stored?.models ?? []) {
 			const owner = parseModelId(model.id, agents)?.agent.id;
-			if (owner && !discovered.has(owner)) restored.set(owner, [...(restored.get(owner) ?? []), model as Model<Api>]);
+			if (!owner || discovered.has(owner)) continue;
+			const list = restored.get(owner) ?? [];
+			list.push(model as Model<Api>);
+			restored.set(owner, list);
 		}
 		for (const [owner, list] of restored) discovered.set(owner, list);
 		if (context.allowNetwork) {
 			await Promise.all(
 				options.config.agents.map((agent) =>
 					discoverAgent(agent, context.signal).catch((error: unknown) =>
-						options.log?.(`${agent.id}: model discovery failed: ${errorMessage(error)}`),
+						log?.(`${agent.id}: model discovery failed: ${errorMessage(error)}`),
 					),
 				),
 			);
@@ -454,7 +453,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	): AssistantMessageEventStream => {
 		const events = createAssistantMessageEventStream();
 		runTurn(events, model, context, streamOptions).catch((error: unknown) =>
-			options.log?.(`stream crashed: ${errorMessage(error)}`),
+			log?.(`stream crashed: ${errorMessage(error)}`),
 		);
 		return events;
 	};
@@ -482,36 +481,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			cwd = nextCwd;
 			for (const client of clients.values()) client.resetSession(nextCwd);
 		},
+		agentFor: (modelId) => parseModelId(modelId, agents)?.agent.id,
 		commands: async (agentId) => (await clients.get(agentId)?.currentCommands()) ?? [],
 		dispose(): void {
 			for (const client of clients.values()) client.dispose();
 			clients.clear();
 		},
 	};
-}
-
-function finishTurn(
-	writer: ReturnType<typeof createMessageWriter>,
-	agent: AcpAgentConfig,
-	stopReason: AcpStopReason,
-): void {
-	switch (stopReason) {
-		case "end_turn":
-			writer.done("stop");
-			return;
-		case "max_tokens":
-		case "max_turn_requests":
-			writer.done("length");
-			return;
-		case "refusal":
-			writer.fail("error", `${agent.name} refused to continue this turn.`);
-			return;
-		case "cancelled":
-			writer.fail("aborted", `${agent.name} cancelled the turn.`);
-			return;
-		default: {
-			const _exhaustive: never = stopReason;
-			void _exhaustive;
-		}
-	}
 }

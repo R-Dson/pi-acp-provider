@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,15 +34,15 @@ function makeFakePi() {
 	return { pi: pi as unknown as ExtensionAPI, providers, handlers, commands, sent, models };
 }
 
-/** Runs `fn` with HOME pointing at a temp dir holding the given settings.json. */
+/** Runs `fn` with Pi's agent dir pointing at a temp dir holding the given settings.json. */
 function withSettings(settings: unknown, fn: () => void | Promise<void>) {
-	const home = mkdtempSync(join(tmpdir(), "pi-acp-"));
-	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-	writeFileSync(join(home, ".pi", "agent", "settings.json"), JSON.stringify(settings));
-	const previous = process.env.HOME;
-	process.env.HOME = home;
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-acp-"));
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	return Promise.resolve(fn()).finally(() => {
-		process.env.HOME = previous;
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
 	});
 }
 
@@ -103,7 +103,10 @@ test("each agent gets a command that completes and runs its advertised slash com
 				signal: new AbortController().signal,
 				publish: async ({ update }: { update?: () => void }) => (update?.(), true),
 			});
-			await new Promise((resolve) => setTimeout(resolve, 100));
+			// Commands arrive in a notification right after session/new.
+			for (let tries = 0; tries < 50 && !(await command.getArgumentCompletions("")); tries++) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
 			assert.deepEqual(await command.getArgumentCompletions("se"), [
 				{ value: "session", label: "session", description: "Session tools (info | rename)" },
 			]);

@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { AcpClient, AcpRpcError, type AcpClientOptions, type ServerRequestHandler } from "../src/acp-client.ts";
 import { autoApprove, parsePermissionRequest, parseRpcMessage, type AcpSessionUpdate } from "../src/acp.ts";
@@ -190,4 +192,38 @@ test("an agent answering with an unsupported protocol version is rejected", asyn
 	const client = makeClient({ agent: { env: { FAKE_PROTOCOL: "2" } } });
 	await assert.rejects(client.ensureReady(), /speaks ACP v2; pi-acp-provider supports v1/);
 	assert.equal(client.state, "uninitialized");
+});
+
+test("a parent SIGTERM kills every agent and still terminates the host", async () => {
+	// Two clients must not each think the other handles the signal.
+	const clientUrl = new URL("../src/acp-client.ts", import.meta.url).href;
+	const script = `
+		import { AcpClient } from ${JSON.stringify(clientUrl)};
+		const agent = { name: "fake", command: process.execPath, args: [${JSON.stringify(fakePath)}], env: {}, authMethod: undefined };
+		const clients = [1, 2].map(() => new AcpClient({ agent, cwd: process.cwd(), handshakeTimeoutMs: 8000, onServerRequest: async () => null }));
+		const infos = await Promise.all(clients.map((client) => client.ensureReady()));
+		console.log(infos.map((info) => info.name.replace("fake-agent-", "")).join(" "));
+		setInterval(() => {}, 1000);
+		process.kill(process.pid, "SIGTERM");
+	`;
+	const host = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "inherit"] });
+	let stdout = "";
+	host.stdout.on("data", (chunk: Buffer) => (stdout += chunk));
+	const watchdog = setTimeout(() => host.kill("SIGKILL"), 8000);
+	const [, signal] = await once(host, "exit");
+	clearTimeout(watchdog);
+	assert.equal(signal, "SIGTERM");
+
+	const alive = (pid: number) => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const pids = stdout.trim().split(" ").map(Number);
+	assert.equal(pids.length, 2);
+	for (let tries = 0; tries < 50 && pids.some(alive); tries++) await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.deepEqual(pids.filter(alive), [], "agent processes are gone");
 });

@@ -1,15 +1,14 @@
 /**
  * Pi extension entry point: registers the `acp` provider.
  *
- * Every agent configured under `acp.agents` in `~/.pi/agent/settings.json`
- * becomes a model, selected with `/model acp/<agent id>`. Each agent process is
+ * Every agent configured under `acp.agents` in Pi's `settings.json` becomes a
+ * model, selected with `/model acp/<agent id>`. Each agent process is
  * spawned lazily on its first prompt, kept alive across prompts, and killed on
  * session shutdown so no orphans remain.
  */
 
-import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { autoReject } from "./acp.ts";
 import { loadSettings, resolveConfig } from "./config.ts";
 import { ACP_PROVIDER_ID, createAcpProvider, type PermissionPolicy } from "./provider.ts";
@@ -32,11 +31,9 @@ function interactivePolicy(getUi: () => PermissionUi | undefined): PermissionPol
 }
 
 export default function acpExtension(pi: ExtensionAPI): void {
-	const debug = process.env.ACP_DEBUG;
-	const log =
-		debug === "1" || debug === "true" ? (message: string) => process.stderr.write(`[acp] ${message}\n`) : undefined;
-	const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+	const settingsPath = join(getAgentDir(), "settings.json");
 	const config = resolveConfig({ settings: loadSettings(settingsPath), env: process.env });
+	const log = config.debug ? (message: string) => process.stderr.write(`[acp] ${message}\n`) : undefined;
 
 	let ui: PermissionUi | undefined;
 	const handle = createAcpProvider({
@@ -70,7 +67,7 @@ export default function acpExtension(pi: ExtensionAPI): void {
 				}
 				// Commands go to the agent, so make sure one of its models is active.
 				const current = ctx.model;
-				const onAgent = current?.provider === ACP_PROVIDER_ID && (current.id === agent.id || current.id.startsWith(`${agent.id}/`));
+				const onAgent = current?.provider === ACP_PROVIDER_ID && handle.agentFor(current.id) === agent.id;
 				if (!onAgent) {
 					const model = handle.provider.getModels().find((candidate) => candidate.id === agent.id);
 					if (!model || !(await pi.setModel(model))) {

@@ -38,8 +38,9 @@ To try it for one session without installing: `pi -e npm:pi-acp-provider`.
 
 ## Configuration
 
-Declare agents under `acp.agents` in `~/.pi/agent/settings.json`. Each key
-becomes a model: `/model acp/<key>`.
+Declare agents under `acp.agents` in `~/.pi/agent/settings.json` (or
+`$PI_CODING_AGENT_DIR/settings.json`). Each key becomes a model:
+`/model acp/<key>`.
 
 ```json
 {
@@ -96,7 +97,7 @@ Global keys:
 | Key | Env override | Default | Meaning |
 |---|---|---|---|
 | `autoApproveTools` | `ACP_AUTO_APPROVE` | `true` | When `false`, each permission request opens a select dialog (TUI/RPC) or is denied (print/JSON mode). |
-| `handshakeTimeoutMs` | | `30000` | Milliseconds to wait for `initialize` and `session/new`. |
+| `handshakeTimeoutMs` | | `30000` | Milliseconds to wait for `initialize`, `session/new`, and model or thinking-level changes. |
 | | `ACP_DEBUG=1` | off | Wire diagnostics on stderr. |
 
 ## Behavior
@@ -104,17 +105,18 @@ Global keys:
 - **Lifecycle**: each agent's process spawns lazily on its first prompt,
   stays alive across prompts, and is killed on session shutdown (`/new`,
   `/resume`, quit, reload). Each agent runs in its own process group, so the
-  whole tree (including tool subprocesses) is killed. Parent signal hooks
-  cover exits without a session shutdown. A crashed agent is respawned with a
-  fresh session on the next prompt.
+  whole tree (including tool subprocesses) is killed. Parent signal hooks,
+  shared by all agents, cover exits without a session shutdown. A crashed
+  agent is respawned with a fresh session on the next prompt.
 - **Session mapping**: one ACP session per Pi session per agent. Each Pi model
   turn sends only the new user message, because the agent keeps conversation
   history on its side. Image attachments are noted but not forwarded.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
   maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Tool
   calls render as `⚙️ Executing [title]...` and, on completion,
-  `✓ title: <first line of output>` (or `✗` on failure). Other update kinds
-  (plans, mode changes) are ignored.
+  `✓ title: <first line of output>` (or `✗` on failure), including calls
+  reported already finished. Other update kinds (plans, mode changes) are
+  ignored.
 - **Abort**: Pi's abort signal (Ctrl+C) sends `session/cancel` and finalizes
   the message as aborted immediately. It answers any open permission prompt
   with `cancelled` and leaves the session usable. The next prompt waits (up to
@@ -161,6 +163,6 @@ real agent or network is needed.
 
 - `src/acp.ts`: ACP v1 / JSON-RPC wire types and boundary parsers
 - `src/acp-client.ts`: child process, NDJSON transport, handshake, sessions, auth
-- `src/provider.ts`: the Pi `Provider` (one model per agent) and event translation
+- `src/provider.ts`: the Pi `Provider` (agents and their discovered models), model and thinking-level selection, and event translation
 - `src/config.ts`: settings and env resolution
 - `src/index.ts`: extension factory (`pi.registerProvider`, lifecycle wiring)

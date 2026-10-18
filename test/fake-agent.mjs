@@ -9,10 +9,12 @@
  *   - "RPCERROR"    fails the prompt with an internal error
  *   - "MAXTOKENS"   finishes with stopReason "max_tokens"
  *   - "REFUSAL"     finishes with stopReason "refusal"
+ *   - "ONESHOT"     first reports a tool call that is already completed
  *   - FAKE_SPLIT=1  writes stdout in small split chunks (line-buffer test)
  *   - FAKE_MODELS=config  session/new returns configOptions (model + thought_level)
  *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
  *                   Replies end with "[model=<id> thought=<level>]".
+ *     FAKE_DEFAULT_MODEL=<id>  the model new sessions start on (default "fast")
  *   - "/context"    (whole prompt) answers like an agent slash command
  *   - FAKE_PROTOCOL=n answers initialize with protocol version n
  *   - FAKE_AUTH=1   session/new fails with auth_required until `authenticate`
@@ -42,7 +44,7 @@ const update = (sessionId, sessionUpdate) =>
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const MODELS = process.env.FAKE_MODELS;
-const settings = { model: "fast", thought: "medium" };
+const settings = { model: process.env.FAKE_DEFAULT_MODEL ?? "fast", thought: "medium" };
 const configOptions = () => [
 	{
 		id: "model",
@@ -139,6 +141,15 @@ async function handlePrompt(message) {
 			content: { type: "text", text: `world #${promptCounter}${approved !== null ? ` [approved=${approved}]` : ""}${MODELS ? ` [model=${settings.model} thought=${settings.thought}]` : ""}` },
 		},
 	];
+	if (text.includes("ONESHOT")) {
+		steps.unshift({
+			sessionUpdate: "tool_call",
+			toolCallId: "t0",
+			title: "read notes",
+			status: "completed",
+			content: [{ type: "content", content: { type: "text", text: "2 notes" } }],
+		});
+	}
 	for (const step of steps) {
 		if (turn.finished) return;
 		update(sessionId, step);

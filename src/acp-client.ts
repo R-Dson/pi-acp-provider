@@ -10,20 +10,22 @@
  * Nothing here is agent-specific: any command that speaks ACP v1 works.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import {
 	ACP_AUTH_REQUIRED,
 	ACP_PROTOCOL_VERSION,
-	configOptionUpdate,
+	RPC_INTERNAL_ERROR,
+	isRecord,
 	parseAvailableCommands,
+	parseConfigOptionUpdate,
 	parseInitializeResult,
-	parseSessionConfig,
 	parseNewSessionResult,
 	parseRpcMessage,
-	parseSessionNotification,
+	parseSessionConfig,
+	parseSessionUpdate,
 	parseStopReason,
-	isRecord,
 	type AcpAgentInfo,
 	type AcpCommand,
 	type AcpSessionConfig,
@@ -48,7 +50,7 @@ export type ServerRequestHandler = (request: ServerRequest) => Promise<unknown>;
 export interface AcpClientOptions {
 	agent: Pick<AcpAgentConfig, "name" | "command" | "args" | "env" | "authMethod">;
 	cwd: string;
-	/** Bounds `initialize` and `session/new`. */
+	/** Bounds `initialize`, `session/new`, and session setting changes. */
 	handshakeTimeoutMs: number;
 	onServerRequest: ServerRequestHandler;
 	log?: ((message: string) => void) | undefined;
@@ -77,25 +79,32 @@ export class AcpRpcError extends Error {
 	}
 }
 
-export const RPC_METHOD_NOT_FOUND = -32601;
-export const RPC_INVALID_PARAMS = -32602;
-const RPC_INTERNAL_ERROR = -32603;
-
 /** How long the next prompt waits for a cancelled turn's final response. */
 const CANCEL_GRACE_MS = 5_000;
 /** How long a SIGTERM'd agent gets before SIGKILL. */
 const KILL_GRACE_MS = 3_000;
 const PARENT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 const IS_WINDOWS = process.platform === "win32";
+/** Sent as `clientInfo`; read from package.json so it tracks releases. */
+const { name: CLIENT_NAME, version: CLIENT_VERSION } = createRequire(import.meta.url)("../package.json") as {
+	name: string;
+	version: string;
+};
+
+interface SessionState {
+	config: AcpSessionConfig;
+	/** The model the session started with, before any switch. */
+	initialModel: string | undefined;
+}
 
 interface Connection {
-	proc: ChildProcess;
+	proc: ChildProcessWithoutNullStreams;
 	state: "starting" | "ready";
 	session: Promise<string> | null;
 	/** Whether the current session has received a prompt (and so has history). */
 	sessionUsed: boolean;
-	/** Settings of every session this process created, by session id. */
-	configs: Map<string, AcpSessionConfig>;
+	/** Every session this process created, by session id. */
+	sessions: Map<string, SessionState>;
 	/** Slash commands the agent advertised, by session id. */
 	commands: Map<string, AcpCommand[]>;
 }
@@ -117,13 +126,6 @@ interface PendingRequest {
 	reject: (error: Error) => void;
 }
 
-interface ActiveTurn {
-	sessionId: string;
-	onUpdate: PromptRequest["onUpdate"];
-	onRawUpdate: PromptRequest["onRawUpdate"];
-	signal: AbortSignal | undefined;
-}
-
 const abortError = (): Error => new Error("Request was aborted");
 
 /** Rejects as soon as `signal` aborts; the underlying work keeps running. */
@@ -142,13 +144,11 @@ function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		const timer = setTimeout(resolve, ms);
 		timer.unref();
-		promise.then(
-			() => {},
-			() => {},
-		).finally(() => {
+		const done = () => {
 			clearTimeout(timer);
 			resolve();
-		});
+		};
+		promise.then(done, done);
 	});
 }
 
@@ -163,7 +163,37 @@ function signalTree(proc: ChildProcess, signal: NodeJS.Signals): void {
 	}
 }
 
+/** Agent processes of every client, killed if Pi exits or is signalled without a session shutdown. */
+const running = new Set<ChildProcess>();
+
+const killRunning = (): void => {
+	for (const proc of running) signalTree(proc, "SIGTERM");
+};
+
+function onParentSignal(signal: NodeJS.Signals): void {
+	killRunning();
+	// Listening masks the default "terminate" disposition; re-raise it when
+	// nobody else handles the signal.
+	if (process.listenerCount(signal) === 1) {
+		setParentHooks(false);
+		process.kill(process.pid, signal);
+	}
+}
+
+/** One set of hooks for all clients, so a lone listener can tell it is alone. */
+function setParentHooks(on: boolean): void {
+	const method = on ? "on" : "off";
+	process[method]("exit", killRunning);
+	for (const signal of PARENT_SIGNALS) process[method](signal, onParentSignal);
+}
+
+function track(proc: ChildProcess): void {
+	if (running.size === 0) setParentHooks(true);
+	running.add(proc);
+}
+
 function terminate(proc: ChildProcess): void {
+	if (running.delete(proc) && running.size === 0) setParentHooks(false);
 	signalTree(proc, "SIGTERM");
 	setTimeout(() => signalTree(proc, "SIGKILL"), KILL_GRACE_MS).unref();
 }
@@ -178,10 +208,9 @@ export class AcpClient {
 	private disposed = false;
 	private nextId = 1;
 	private readonly pending = new Map<RpcId, PendingRequest>();
-	private turn: ActiveTurn | null = null;
+	private turn: PromptRequest | null = null;
 	/** Settles once a cancelled turn's `session/prompt` response has arrived. */
 	private draining: Promise<void> = Promise.resolve();
-	private parentHooks: [event: string, handler: () => void][] = [];
 
 	constructor(options: AcpClientOptions) {
 		this.options = options;
@@ -227,7 +256,12 @@ export class AcpClient {
 
 	/** The models and reasoning levels a live session offers. */
 	sessionConfig(sessionId: string): AcpSessionConfig | undefined {
-		return this.conn?.configs.get(sessionId);
+		return this.conn?.sessions.get(sessionId)?.config;
+	}
+
+	/** The model a live session started with, if the agent reported one. */
+	initialModel(sessionId: string): string | undefined {
+		return this.conn?.sessions.get(sessionId)?.initialModel;
 	}
 
 	/**
@@ -235,23 +269,21 @@ export class AcpClient {
 	 * `session/set_config_option` or the legacy `session/set_model`.
 	 */
 	async setSessionSetting(sessionId: string, setting: SessionSetting, value: string, signal?: AbortSignal): Promise<void> {
-		const conn = this.conn;
-		const select = conn?.configs.get(sessionId)?.[setting];
-		if (!conn || !select) throw new Error(`${this.options.agent.name} offers no ${setting} setting for this session`);
+		const session = this.conn?.sessions.get(sessionId);
+		const select = session?.config[setting];
+		if (!session || !select) throw new Error(`${this.options.agent.name} offers no ${setting} setting for this session`);
 		if (select.currentValue === value) return;
 		const timeout = this.options.handshakeTimeoutMs;
 		if (select.configId === null) {
 			await abortable(this.request("session/set_model", { sessionId, modelId: value }, timeout), signal);
-			const config = conn.configs.get(sessionId);
-			if (config?.model) config.model = { ...config.model, currentValue: value };
+			select.currentValue = value;
 			return;
 		}
 		const result = await abortable(
 			this.request("session/set_config_option", { sessionId, configId: select.configId, value }, timeout),
 			signal,
 		);
-		const previous = conn.configs.get(sessionId);
-		if (previous) conn.configs.set(sessionId, parseSessionConfig(result, previous));
+		session.config = parseSessionConfig(result, session.config);
 	}
 
 	/**
@@ -271,13 +303,7 @@ export class AcpClient {
 	async prompt(request: PromptRequest): Promise<PromptResult> {
 		if (this.turn) throw new Error(`Another ${this.options.agent.name} prompt is already in flight`);
 		const { sessionId, signal } = request;
-		const turn: ActiveTurn = {
-			sessionId,
-			onUpdate: request.onUpdate,
-			onRawUpdate: request.onRawUpdate,
-			signal,
-		};
-		this.turn = turn;
+		this.turn = request;
 		if (this.conn) this.conn.sessionUsed = true;
 		try {
 			await this.draining;
@@ -300,7 +326,7 @@ export class AcpClient {
 				finished.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
 			});
 		} finally {
-			if (this.turn === turn) this.turn = null;
+			if (this.turn === request) this.turn = null;
 		}
 	}
 
@@ -308,18 +334,16 @@ export class AcpClient {
 	dispose(): void {
 		this.disposed = true;
 		if (this.conn) this.close(this.conn, new Error("ACP client was disposed"));
-		for (const [event, handler] of this.parentHooks) process.removeListener(event, handler);
-		this.parentHooks = [];
 	}
 
 	/** `session/new`, authenticating once with the configured method if the agent asks. */
 	private async newSession(conn: Connection, authenticate: boolean): Promise<string> {
 		const create = async () => {
-			const result = parseNewSessionResult(
+			const { sessionId, config } = parseNewSessionResult(
 				await this.request("session/new", { cwd: this.cwd, mcpServers: [] }, this.options.handshakeTimeoutMs),
 			);
-			conn.configs.set(result.sessionId, result.config);
-			return result.sessionId;
+			conn.sessions.set(sessionId, { config, initialModel: config.model?.currentValue });
+			return sessionId;
 		};
 		try {
 			return await create();
@@ -343,7 +367,7 @@ export class AcpClient {
 					protocolVersion: ACP_PROTOCOL_VERSION,
 					// Agents use their own file and terminal tools.
 					clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-					clientInfo: { name: "pi-acp-provider", version: "1.2.0" },
+					clientInfo: { name: CLIENT_NAME, version: CLIENT_VERSION },
 				},
 				this.options.handshakeTimeoutMs,
 			);
@@ -351,12 +375,12 @@ export class AcpClient {
 			// The agent answers with the version it will speak; we only speak v1.
 			if (info.protocolVersion !== ACP_PROTOCOL_VERSION) {
 				throw new Error(
-					`${this.options.agent.name} speaks ACP v${info.protocolVersion}; pi-acp-provider supports v${ACP_PROTOCOL_VERSION}.`,
+					`${this.options.agent.name} speaks ACP v${info.protocolVersion}; ${CLIENT_NAME} supports v${ACP_PROTOCOL_VERSION}.`,
 				);
 			}
 			conn.state = "ready";
 			this.agentInfo = info;
-			return this.agentInfo;
+			return info;
 		} catch (error) {
 			this.close(conn, error instanceof Error ? error : new Error(String(error)));
 			throw error;
@@ -368,27 +392,25 @@ export class AcpClient {
 		const proc = spawn(agent.command, agent.args, {
 			cwd: this.cwd,
 			env: { ...process.env, ...agent.env },
-			stdio: ["pipe", "pipe", "pipe"],
 			// Own process group, so the whole tree can be killed at once.
 			detached: !IS_WINDOWS,
 		});
-		const conn: Connection = { proc, state: "starting", session: null, sessionUsed: false, configs: new Map(), commands: new Map() };
+		const conn: Connection = { proc, state: "starting", session: null, sessionUsed: false, sessions: new Map(), commands: new Map() };
 		this.conn = conn;
-		this.installParentHooks();
+		track(proc);
 
 		// EPIPE after a kill must not crash the host.
-		proc.stdin?.on("error", (error) => this.log(`stdin error: ${error.message}`));
-		proc.stderr?.on("data", (chunk: Buffer) => this.log(`agent stderr: ${chunk.toString().trimEnd()}`));
-		if (proc.stdout) {
-			createInterface({ input: proc.stdout }).on("line", (line) => {
-				if (this.conn !== conn) return;
-				try {
-					this.handleLine(line);
-				} catch (error) {
-					this.log(`line handler failed: ${String(error)}`);
-				}
-			});
-		}
+		proc.stdin.on("error", (error) => this.log(`stdin error: ${error.message}`));
+		// Always drained, so a chatty agent never blocks on a full stderr pipe.
+		proc.stderr.on("data", (chunk: Buffer) => this.log(`agent stderr: ${chunk.toString().trimEnd()}`));
+		createInterface({ input: proc.stdout }).on("line", (line) => {
+			if (this.conn !== conn) return;
+			try {
+				this.handleLine(line);
+			} catch (error) {
+				this.log(`line handler failed: ${String(error)}`);
+			}
+		});
 		proc.on("error", (error: NodeJS.ErrnoException) => {
 			this.close(
 				conn,
@@ -414,28 +436,6 @@ export class AcpClient {
 		this.draining = Promise.resolve();
 		for (const entry of [...this.pending.values()]) entry.reject(reason);
 		terminate(conn.proc);
-	}
-
-	/** Kills the agent if Pi exits or is signalled without a session shutdown. */
-	private installParentHooks(): void {
-		if (this.parentHooks.length > 0) return;
-		const kill = () => {
-			if (this.conn) signalTree(this.conn.proc, "SIGTERM");
-		};
-		this.parentHooks.push(["exit", kill]);
-		for (const signal of PARENT_SIGNALS) {
-			const handler = () => {
-				kill();
-				// Listening masks the default "terminate" disposition; re-raise it
-				// when nobody else handles the signal.
-				if (process.listenerCount(signal) === 1) {
-					this.dispose();
-					process.kill(process.pid, signal);
-				}
-			};
-			this.parentHooks.push([signal, handler]);
-		}
-		for (const [event, handler] of this.parentHooks) process.on(event, handler);
 	}
 
 	private write(message: object): boolean {
@@ -491,46 +491,36 @@ export class AcpClient {
 			this.log("discarded non-RPC line");
 			return;
 		}
-		switch (message.kind) {
-			case "response": {
-				const entry = this.pending.get(message.id);
-				if (!entry) {
-					this.log(`response for unknown request id ${message.id}`);
-					return;
-				}
-				const { outcome } = message;
-				if (outcome.ok) entry.resolve(outcome.result);
-				else entry.reject(new AcpRpcError(outcome.error.message, outcome.error.code));
-				return;
-			}
-			case "request":
-				void this.answerServerRequest(message.id, message.method, message.params);
-				return;
-			case "notification":
-				if (message.method === "session/update") this.dispatchUpdate(message.params);
-				return;
-			default: {
-				const _exhaustive: never = message;
-				void _exhaustive;
-			}
+		if (message.kind === "request") {
+			void this.answerServerRequest(message.id, message.method, message.params);
+		} else if (message.kind === "notification") {
+			if (message.method === "session/update") this.dispatchUpdate(message.params);
+		} else {
+			const entry = this.pending.get(message.id);
+			const { outcome } = message;
+			if (!entry) this.log(`response for unknown request id ${message.id}`);
+			else if (outcome.ok) entry.resolve(outcome.result);
+			else entry.reject(new AcpRpcError(outcome.error.message, outcome.error.code));
 		}
 	}
 
 	private dispatchUpdate(params: unknown): void {
 		// Settings and commands can change outside a turn (e.g. the agent's own `/model`).
+		if (!isRecord(params) || typeof params.sessionId !== "string") return;
+		const { sessionId } = params;
 		const conn = this.conn;
-		if (conn && isRecord(params) && typeof params.sessionId === "string") {
-			const previous = conn.configs.get(params.sessionId);
-			const configUpdate = configOptionUpdate(params);
-			if (configUpdate && previous) conn.configs.set(params.sessionId, parseSessionConfig(configUpdate, previous));
+		if (conn) {
+			const session = conn.sessions.get(sessionId);
+			const config = session && parseConfigOptionUpdate(params, session.config);
+			if (session && config) session.config = config;
 			const commands = parseAvailableCommands(params);
-			if (commands) conn.commands.set(params.sessionId, commands);
+			if (commands) conn.commands.set(sessionId, commands);
 		}
 		const turn = this.turn;
-		if (!turn || !isRecord(params) || params.sessionId !== turn.sessionId) return;
+		if (!turn || sessionId !== turn.sessionId) return;
 		turn.onRawUpdate?.(params);
-		const notification = parseSessionNotification(params);
-		if (notification) turn.onUpdate(notification.update);
+		const update = parseSessionUpdate(params);
+		if (update) turn.onUpdate(update);
 	}
 
 	private async answerServerRequest(id: RpcId, method: string, params: unknown): Promise<void> {

@@ -12,11 +12,20 @@ export const ACP_PROTOCOL_VERSION = 1;
 /** ACP `auth_required` error code, returned by `session/new` or `session/prompt`. */
 export const ACP_AUTH_REQUIRED = -32000;
 
+export const RPC_METHOD_NOT_FOUND = -32601;
+export const RPC_INVALID_PARAMS = -32602;
+export const RPC_INTERNAL_ERROR = -32603;
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 const optionalString = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+
+/** `value` if it is one of `allowed`, else undefined. */
+function oneOf<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
+	return allowed.includes(value as T) ? (value as T) : undefined;
+}
 
 // --- JSON-RPC envelopes ------------------------------------------------------
 
@@ -53,7 +62,7 @@ export function parseRpcMessage(value: unknown): RpcIncoming | null {
 			outcome: {
 				ok: false,
 				error: {
-					code: typeof error.code === "number" ? error.code : -32603,
+					code: typeof error.code === "number" ? error.code : RPC_INTERNAL_ERROR,
 					message: optionalString(error.message) ?? "Unknown agent error",
 				},
 			},
@@ -64,25 +73,21 @@ export function parseRpcMessage(value: unknown): RpcIncoming | null {
 
 // --- session/update ----------------------------------------------------------
 
-export type ToolCallStatus = "pending" | "in_progress" | "completed" | "failed";
+const TOOL_CALL_STATUSES = ["pending", "in_progress", "completed", "failed"] as const;
+export type ToolCallStatus = (typeof TOOL_CALL_STATUSES)[number];
 
 /** The `session/update` variants the provider renders; everything else is dropped. */
 export type AcpSessionUpdate =
 	| { type: "agent_message_chunk"; text: string }
 	| { type: "agent_thought_chunk"; text: string }
-	| { type: "tool_call"; toolCallId: string; title: string; status: ToolCallStatus | undefined }
 	| {
-			type: "tool_call_update";
+			/** `tool_call` announces a call; `tool_call_update` reports on it. Either may carry a final status. */
+			type: "tool_call" | "tool_call_update";
 			toolCallId: string;
 			title: string | undefined;
 			status: ToolCallStatus | undefined;
 			summary: string;
 	  };
-
-export interface AcpSessionNotification {
-	sessionId: string;
-	update: AcpSessionUpdate;
-}
 
 export interface AcpCommand {
 	name: string;
@@ -91,11 +96,14 @@ export interface AcpCommand {
 	hint: string | undefined;
 }
 
+/** The `update` object of `session/update` params (`{ sessionId, update: { sessionUpdate, ... } }`). */
+const updateOf = (params: unknown): Record<string, unknown> | undefined =>
+	isRecord(params) && isRecord(params.update) ? params.update : undefined;
+
 /** `available_commands_update`'s full command list, or null for other updates. */
 export function parseAvailableCommands(params: unknown): AcpCommand[] | null {
-	if (!isRecord(params) || !isRecord(params.update)) return null;
-	const { update } = params;
-	if (update.sessionUpdate !== "available_commands_update" || !Array.isArray(update.availableCommands)) return null;
+	const update = updateOf(params);
+	if (update?.sessionUpdate !== "available_commands_update" || !Array.isArray(update.availableCommands)) return null;
 	return update.availableCommands.flatMap((command): AcpCommand[] =>
 		isRecord(command) && typeof command.name === "string"
 			? [
@@ -107,24 +115,6 @@ export function parseAvailableCommands(params: unknown): AcpCommand[] | null {
 				]
 			: [],
 	);
-}
-
-/** `config_option_update` params' full configOptions snapshot, or null for other updates. */
-export function configOptionUpdate(params: unknown): unknown {
-	if (!isRecord(params) || !isRecord(params.update)) return null;
-	return params.update.sessionUpdate === "config_option_update" ? params.update : null;
-}
-
-function parseToolCallStatus(value: unknown): ToolCallStatus | undefined {
-	switch (value) {
-		case "pending":
-		case "in_progress":
-		case "completed":
-		case "failed":
-			return value;
-		default:
-			return undefined;
-	}
 }
 
 /** Text of a `ContentBlock`; non-text blocks (images, resources) render as nothing. */
@@ -144,42 +134,31 @@ function toolContentSummary(content: unknown): string {
 	return parts.filter(Boolean).join("; ");
 }
 
-/** Parses spec-shaped `{ sessionId, update: { sessionUpdate, ... } }` params. */
-export function parseSessionNotification(params: unknown): AcpSessionNotification | null {
-	if (!isRecord(params) || typeof params.sessionId !== "string" || !isRecord(params.update)) return null;
-	const { sessionId, update: raw } = params;
-	const update = ((): AcpSessionUpdate | null => {
-		switch (raw.sessionUpdate) {
-			case "agent_message_chunk":
-			case "agent_thought_chunk":
-				return { type: raw.sessionUpdate, text: contentBlockText(raw.content) };
-			case "tool_call":
-				if (typeof raw.toolCallId !== "string") return null;
-				return {
-					type: "tool_call",
-					toolCallId: raw.toolCallId,
-					title: optionalString(raw.title) ?? "tool",
-					status: parseToolCallStatus(raw.status),
-				};
-			case "tool_call_update":
-				if (typeof raw.toolCallId !== "string") return null;
-				return {
-					type: "tool_call_update",
-					toolCallId: raw.toolCallId,
-					title: optionalString(raw.title),
-					status: parseToolCallStatus(raw.status),
-					summary: toolContentSummary(raw.content),
-				};
-			default:
-				return null;
-		}
-	})();
-	return update ? { sessionId, update } : null;
+export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
+	const update = updateOf(params);
+	switch (update?.sessionUpdate) {
+		case "agent_message_chunk":
+		case "agent_thought_chunk":
+			return { type: update.sessionUpdate, text: contentBlockText(update.content) };
+		case "tool_call":
+		case "tool_call_update":
+			if (typeof update.toolCallId !== "string") return null;
+			return {
+				type: update.sessionUpdate,
+				toolCallId: update.toolCallId,
+				title: optionalString(update.title),
+				status: oneOf(TOOL_CALL_STATUSES, update.status),
+				summary: toolContentSummary(update.content),
+			};
+		default:
+			return null;
+	}
 }
 
 // --- session/request_permission ---------------------------------------------
 
-export type PermissionOptionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
+const PERMISSION_KINDS = ["allow_once", "allow_always", "reject_once", "reject_always"] as const;
+export type PermissionOptionKind = (typeof PERMISSION_KINDS)[number];
 
 export interface AcpPermissionOption {
 	optionId: string;
@@ -195,24 +174,12 @@ export interface AcpPermissionRequest {
 
 export type AcpPermissionOutcome = { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
 
-function parsePermissionKind(value: unknown): PermissionOptionKind | undefined {
-	switch (value) {
-		case "allow_once":
-		case "allow_always":
-		case "reject_once":
-		case "reject_always":
-			return value;
-		default:
-			return undefined;
-	}
-}
-
 export function parsePermissionRequest(params: unknown): AcpPermissionRequest | null {
 	if (!isRecord(params) || !Array.isArray(params.options)) return null;
 	const options: AcpPermissionOption[] = [];
 	for (const option of params.options) {
 		if (!isRecord(option) || typeof option.optionId !== "string") continue;
-		const kind = parsePermissionKind(option.kind);
+		const kind = oneOf(PERMISSION_KINDS, option.kind);
 		if (!kind) continue;
 		options.push({ optionId: option.optionId, name: optionalString(option.name) ?? option.optionId, kind });
 	}
@@ -221,7 +188,7 @@ export function parsePermissionRequest(params: unknown): AcpPermissionRequest | 
 }
 
 /** Selects the first offered option of the given kinds, in preference order. */
-export function selectOption(request: AcpPermissionRequest, kinds: PermissionOptionKind[]): AcpPermissionOutcome {
+function selectOption(request: AcpPermissionRequest, kinds: PermissionOptionKind[]): AcpPermissionOutcome {
 	for (const kind of kinds) {
 		const option = request.options.find((candidate) => candidate.kind === kind);
 		if (option) return { outcome: "selected", optionId: option.optionId };
@@ -300,7 +267,11 @@ export interface AcpSessionConfig {
 	thoughtLevel: AcpSelect | undefined;
 }
 
-export const emptySessionConfig = (): AcpSessionConfig => ({ model: undefined, thoughtLevel: undefined });
+const emptySessionConfig = (): AcpSessionConfig => ({ model: undefined, thoughtLevel: undefined });
+
+function parseChoice(record: Record<string, unknown>, value: string): AcpChoice {
+	return { value, name: optionalString(record.name) ?? value, description: optionalString(record.description) };
+}
 
 /** Flattens a select option's `options`, which may be flat or grouped. */
 function parseChoices(value: unknown): AcpChoice[] {
@@ -309,19 +280,18 @@ function parseChoices(value: unknown): AcpChoice[] {
 		if (!isRecord(item)) return [];
 		if (Array.isArray(item.options)) return parseChoices(item.options);
 		if (typeof item.value !== "string") return [];
-		return [{ value: item.value, name: optionalString(item.name) ?? item.value, description: optionalString(item.description) }];
+		return [parseChoice(item, item.value)];
 	});
 }
 
 /** The `select` config option of `category`, from a `configOptions` array. */
 function findSelect(configOptions: unknown, category: string): AcpSelect | undefined {
 	if (!Array.isArray(configOptions)) return undefined;
-	for (const option of configOptions) {
-		if (!isRecord(option) || option.category !== category || option.type !== "select") continue;
-		if (typeof option.id !== "string") continue;
-		return { configId: option.id, currentValue: optionalString(option.currentValue), choices: parseChoices(option.options) };
-	}
-	return undefined;
+	const option: unknown = configOptions.find(
+		(candidate) => isRecord(candidate) && candidate.category === category && candidate.type === "select",
+	);
+	if (!isRecord(option) || typeof option.id !== "string") return undefined;
+	return { configId: option.id, currentValue: optionalString(option.currentValue), choices: parseChoices(option.options) };
 }
 
 /** Legacy (pre-config-options) `models: { availableModels, currentModelId }`. */
@@ -329,7 +299,7 @@ function parseLegacyModels(value: unknown): AcpSelect | undefined {
 	if (!isRecord(value) || !Array.isArray(value.availableModels)) return undefined;
 	const choices = value.availableModels.flatMap((model): AcpChoice[] =>
 		isRecord(model) && typeof model.modelId === "string"
-			? [{ value: model.modelId, name: optionalString(model.name) ?? model.modelId, description: optionalString(model.description) }]
+			? [parseChoice(model, model.modelId)]
 			: [],
 	);
 	return { configId: null, currentValue: optionalString(value.currentModelId), choices };
@@ -352,29 +322,23 @@ export function parseSessionConfig(result: unknown, previous: AcpSessionConfig =
 	};
 }
 
-export interface AcpNewSession {
-	sessionId: string;
-	config: AcpSessionConfig;
+/** The session settings after a `config_option_update`, or null for other updates. */
+export function parseConfigOptionUpdate(params: unknown, previous: AcpSessionConfig): AcpSessionConfig | null {
+	const update = updateOf(params);
+	return update?.sessionUpdate === "config_option_update" ? parseSessionConfig(update, previous) : null;
 }
 
-export function parseNewSessionResult(result: unknown): AcpNewSession {
+export function parseNewSessionResult(result: unknown): { sessionId: string; config: AcpSessionConfig } {
 	if (!isRecord(result) || typeof result.sessionId !== "string" || result.sessionId.length === 0) {
 		throw new Error("session/new did not return a sessionId");
 	}
 	return { sessionId: result.sessionId, config: parseSessionConfig(result) };
 }
 
-export type AcpStopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
+const STOP_REASONS = ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"] as const;
+export type AcpStopReason = (typeof STOP_REASONS)[number];
 
+/** Unknown or missing reasons count as `end_turn`. */
 export function parseStopReason(result: unknown): AcpStopReason {
-	const reason = isRecord(result) ? result.stopReason : undefined;
-	switch (reason) {
-		case "max_tokens":
-		case "max_turn_requests":
-		case "refusal":
-		case "cancelled":
-			return reason;
-		default:
-			return "end_turn";
-	}
+	return oneOf(STOP_REASONS, isRecord(result) ? result.stopReason : undefined) ?? "end_turn";
 }

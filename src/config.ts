@@ -1,9 +1,9 @@
 /**
  * Configuration for the ACP provider extension.
  *
- * Agents are declared under `acp.agents` in `~/.pi/agent/settings.json`; each
- * becomes the model `acp/<id>`. Environment variables override the global
- * options.
+ * Agents are declared under `acp.agents` in Pi's `settings.json`
+ * (`~/.pi/agent/` by default); each becomes the model `acp/<id>`.
+ * Environment variables override the global options.
  */
 
 import { readFileSync } from "node:fs";
@@ -25,8 +25,10 @@ export interface AcpAgentConfig {
 export interface AcpProviderConfig {
 	agents: AcpAgentConfig[];
 	autoApproveTools: boolean;
-	/** Bounds `initialize` and `session/new`. */
+	/** Bounds `initialize`, `session/new`, and session setting changes. */
 	handshakeTimeoutMs: number;
+	/** Wire diagnostics on stderr (`ACP_DEBUG`). */
+	debug: boolean;
 }
 
 export type AcpAgentSettings = Partial<Omit<AcpAgentConfig, "id" | "command">> & { command: string };
@@ -124,5 +126,6 @@ export function resolveConfig({
 		autoApproveTools:
 			parseBooleanFlag(env.ACP_AUTO_APPROVE) ?? settings.autoApproveTools ?? DEFAULTS.autoApproveTools,
 		handshakeTimeoutMs: settings.handshakeTimeoutMs ?? DEFAULTS.handshakeTimeoutMs,
+		debug: parseBooleanFlag(env.ACP_DEBUG) ?? false,
 	};
 }
