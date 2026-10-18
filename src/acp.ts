@@ -84,6 +84,31 @@ export interface AcpSessionNotification {
 	update: AcpSessionUpdate;
 }
 
+export interface AcpCommand {
+	name: string;
+	description: string;
+	/** Describes the command's arguments, when it takes any. */
+	hint: string | undefined;
+}
+
+/** `available_commands_update`'s full command list, or null for other updates. */
+export function parseAvailableCommands(params: unknown): AcpCommand[] | null {
+	if (!isRecord(params) || !isRecord(params.update)) return null;
+	const { update } = params;
+	if (update.sessionUpdate !== "available_commands_update" || !Array.isArray(update.availableCommands)) return null;
+	return update.availableCommands.flatMap((command): AcpCommand[] =>
+		isRecord(command) && typeof command.name === "string"
+			? [
+					{
+						name: command.name,
+						description: optionalString(command.description) ?? "",
+						hint: isRecord(command.input) ? optionalString(command.input.hint) : undefined,
+					},
+				]
+			: [],
+	);
+}
+
 /** `config_option_update` params' full configOptions snapshot, or null for other updates. */
 export function configOptionUpdate(params: unknown): unknown {
 	if (!isRecord(params) || !isRecord(params.update)) return null;

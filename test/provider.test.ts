@@ -355,3 +355,11 @@ test("agents without model support list only their default model after discovery
 	await handle.provider.refreshModels?.(storeContext().context);
 	assert.deepEqual(handle.provider.getModels().map((model) => model.id), ["fake"]);
 });
+
+test("an agent slash command sent as the prompt returns the agent's output", async () => {
+	const handle = makeProvider();
+	const last = await lastEvent(handle, "/context");
+	assert.ok(last?.type === "done");
+	assert.equal(messageText(last.message), "context: 42%");
+	assert.deepEqual((await handle.commands("fake")).map((command) => command.name), ["context", "session"]);
+});

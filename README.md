@@ -72,6 +72,15 @@ option, Pi's thinking level (`shift+tab`, `--thinking`) is applied to it; levels
 the agent doesn't offer are hidden. Discovery never triggers `authMethod`
 sign-in; that waits for the first prompt.
 
+### Agent slash commands
+
+Each agent registers a Pi command named after its key. `/<key> <command>`
+runs a slash command the agent advertises over ACP (`available_commands_update`),
+e.g. `/copilot context` or `/copilot session info` for Copilot CLI. Arguments
+autocomplete from the agent's current list. `/<key>` alone lists the commands.
+Running one switches to that agent if another model is active, then sends
+`/<command>` as the prompt, which is how ACP agents expect commands.
+
 Per-agent keys:
 
 | Key | Required | Meaning |

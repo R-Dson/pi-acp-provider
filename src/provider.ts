@@ -34,6 +34,7 @@ import {
 	ACP_AUTH_REQUIRED,
 	autoApprove,
 	type AcpAgentInfo,
+	type AcpCommand,
 	type AcpSelect,
 	type AcpSessionConfig,
 	parsePermissionRequest,
@@ -126,6 +127,8 @@ export interface AcpProviderHandle {
 	provider: Provider;
 	/** Starts fresh ACP sessions in `cwd` on the next prompt (a new Pi session). */
 	resetSession(cwd: string): void;
+	/** Slash commands the agent's current session advertised; empty until it has started. */
+	commands(agentId: string): Promise<AcpCommand[]>;
 	/** Kills all agent processes; the provider respawns them if used again. */
 	dispose(): void;
 }
@@ -479,6 +482,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			cwd = nextCwd;
 			for (const client of clients.values()) client.resetSession(nextCwd);
 		},
+		commands: async (agentId) => (await clients.get(agentId)?.currentCommands()) ?? [],
 		dispose(): void {
 			for (const client of clients.values()) client.dispose();
 			clients.clear();

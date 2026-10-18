@@ -12,7 +12,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { autoReject } from "./acp.ts";
 import { loadSettings, resolveConfig } from "./config.ts";
-import { createAcpProvider, type PermissionPolicy } from "./provider.ts";
+import { ACP_PROVIDER_ID, createAcpProvider, type PermissionPolicy } from "./provider.ts";
 
 type PermissionUi = Pick<ExtensionUIContext, "select">;
 
@@ -45,6 +45,43 @@ export default function acpExtension(pi: ExtensionAPI): void {
 		...(config.autoApproveTools ? {} : { permissionPolicy: interactivePolicy(() => ui) }),
 	});
 	pi.registerProvider(handle.provider);
+
+	// `/<agent id> <command>` runs a slash command the agent advertised
+	// (e.g. Copilot's `/context`) by sending it to the agent as the prompt.
+	for (const agent of config.agents) {
+		pi.registerCommand(agent.id, {
+			description: `Run a ${agent.name} slash command`,
+			getArgumentCompletions: async (prefix) => {
+				const items = (await handle.commands(agent.id))
+					.filter((command) => command.name.startsWith(prefix.trim()))
+					.map((command) => ({
+						value: command.name,
+						label: command.name,
+						description: [command.description, command.hint && `(${command.hint})`].filter(Boolean).join(" "),
+					}));
+				return items.length > 0 ? items : null;
+			},
+			handler: async (args, ctx) => {
+				if (!args.trim()) {
+					const commands = await handle.commands(agent.id);
+					const list = commands.map((command) => `/${agent.id} ${command.name}  ${command.description}`).join("\n");
+					ctx.ui.notify(list || `${agent.name} has not advertised any commands yet.`, "info");
+					return;
+				}
+				// Commands go to the agent, so make sure one of its models is active.
+				const current = ctx.model;
+				const onAgent = current?.provider === ACP_PROVIDER_ID && (current.id === agent.id || current.id.startsWith(`${agent.id}/`));
+				if (!onAgent) {
+					const model = handle.provider.getModels().find((candidate) => candidate.id === agent.id);
+					if (!model || !(await pi.setModel(model))) {
+						ctx.ui.notify(`Could not switch to ${agent.name}.`, "error");
+						return;
+					}
+				}
+				pi.sendUserMessage(`/${args.trim()}`);
+			},
+		});
+	}
 
 	pi.on("session_start", (event, ctx) => {
 		// A new Pi session (`/new`, `/resume`, `/fork`) gets new ACP sessions.

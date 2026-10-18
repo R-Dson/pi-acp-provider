@@ -13,6 +13,7 @@
  *   - FAKE_MODELS=config  session/new returns configOptions (model + thought_level)
  *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
  *                   Replies end with "[model=<id> thought=<level>]".
+ *   - "/context"    (whole prompt) answers like an agent slash command
  *   - FAKE_PROTOCOL=n answers initialize with protocol version n
  *   - FAKE_AUTH=1   session/new fails with auth_required until `authenticate`
  *                   is called with methodId "fake-login"
@@ -98,6 +99,10 @@ async function handlePrompt(message) {
 	activePrompt = turn;
 	const stepDelay = text.includes("SLOW") ? 150 : 5;
 
+	if (text === "/context") {
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "context: 42%" } });
+		return turn.finish("end_turn");
+	}
 	if (text.includes("AUTH")) return replyError(message.id, -32000, "Authentication required");
 	if (text.includes("RPCERROR")) return replyError(message.id, -32603, "fake rpc failure");
 
@@ -176,7 +181,17 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		case "session/new":
 			if (!authenticated) replyError(message.id, -32000, "Authentication required");
-			else reply(message.id, { sessionId: `sess-${++sessionCounter}`, ...sessionExtras() });
+			else {
+				const sessionId = `sess-${++sessionCounter}`;
+				reply(message.id, { sessionId, ...sessionExtras() });
+				update(sessionId, {
+					sessionUpdate: "available_commands_update",
+					availableCommands: [
+						{ name: "context", description: "Show context usage" },
+						{ name: "session", description: "Session tools", input: { hint: "info | rename" } },
+					],
+				});
+			}
 			break;
 		case "session/set_config_option": {
 			const { configId, value } = message.params;

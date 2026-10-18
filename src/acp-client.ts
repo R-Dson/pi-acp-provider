@@ -16,6 +16,7 @@ import {
 	ACP_AUTH_REQUIRED,
 	ACP_PROTOCOL_VERSION,
 	configOptionUpdate,
+	parseAvailableCommands,
 	parseInitializeResult,
 	parseSessionConfig,
 	parseNewSessionResult,
@@ -24,6 +25,7 @@ import {
 	parseStopReason,
 	isRecord,
 	type AcpAgentInfo,
+	type AcpCommand,
 	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type AcpStopReason,
@@ -94,6 +96,8 @@ interface Connection {
 	sessionUsed: boolean;
 	/** Settings of every session this process created, by session id. */
 	configs: Map<string, AcpSessionConfig>;
+	/** Slash commands the agent advertised, by session id. */
+	commands: Map<string, AcpCommand[]>;
 }
 
 export interface EnsureSessionOptions {
@@ -214,6 +218,13 @@ export class AcpClient {
 		return abortable(conn.session, signal);
 	}
 
+	/** Slash commands the current session advertised (`available_commands_update`). */
+	async currentCommands(): Promise<AcpCommand[]> {
+		const conn = this.conn;
+		const sessionId = await conn?.session?.catch(() => undefined);
+		return (sessionId && conn?.commands.get(sessionId)) || [];
+	}
+
 	/** The models and reasoning levels a live session offers. */
 	sessionConfig(sessionId: string): AcpSessionConfig | undefined {
 		return this.conn?.configs.get(sessionId);
@@ -332,7 +343,7 @@ export class AcpClient {
 					protocolVersion: ACP_PROTOCOL_VERSION,
 					// Agents use their own file and terminal tools.
 					clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-					clientInfo: { name: "pi-acp-provider", version: "1.1.0" },
+					clientInfo: { name: "pi-acp-provider", version: "1.2.0" },
 				},
 				this.options.handshakeTimeoutMs,
 			);
@@ -361,7 +372,7 @@ export class AcpClient {
 			// Own process group, so the whole tree can be killed at once.
 			detached: !IS_WINDOWS,
 		});
-		const conn: Connection = { proc, state: "starting", session: null, sessionUsed: false, configs: new Map() };
+		const conn: Connection = { proc, state: "starting", session: null, sessionUsed: false, configs: new Map(), commands: new Map() };
 		this.conn = conn;
 		this.installParentHooks();
 
@@ -506,12 +517,14 @@ export class AcpClient {
 	}
 
 	private dispatchUpdate(params: unknown): void {
-		// Settings can change outside a turn (e.g. the agent's own `/model`).
-		const configUpdate = configOptionUpdate(params);
-		const configs = this.conn?.configs;
-		if (configUpdate && configs && isRecord(params) && typeof params.sessionId === "string") {
-			const previous = configs.get(params.sessionId);
-			if (previous) configs.set(params.sessionId, parseSessionConfig(configUpdate, previous));
+		// Settings and commands can change outside a turn (e.g. the agent's own `/model`).
+		const conn = this.conn;
+		if (conn && isRecord(params) && typeof params.sessionId === "string") {
+			const previous = conn.configs.get(params.sessionId);
+			const configUpdate = configOptionUpdate(params);
+			if (configUpdate && previous) conn.configs.set(params.sessionId, parseSessionConfig(configUpdate, previous));
+			const commands = parseAvailableCommands(params);
+			if (commands) conn.commands.set(params.sessionId, commands);
 		}
 		const turn = this.turn;
 		if (!turn || !isRecord(params) || params.sessionId !== turn.sessionId) return;
