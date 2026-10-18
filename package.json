@@ -1,6 +1,6 @@
 {
   "name": "pi-acp-provider",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Pi agent provider extension that delegates execution to any Agent Client Protocol (ACP) agent, such as GitHub Copilot CLI or Gemini CLI.",
   "type": "module",
   "keywords": [
