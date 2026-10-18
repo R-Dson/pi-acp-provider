@@ -15,13 +15,16 @@ import { createInterface } from "node:readline";
 import {
 	ACP_AUTH_REQUIRED,
 	ACP_PROTOCOL_VERSION,
+	configOptionUpdate,
 	parseInitializeResult,
+	parseSessionConfig,
 	parseNewSessionResult,
 	parseRpcMessage,
 	parseSessionNotification,
 	parseStopReason,
 	isRecord,
 	type AcpAgentInfo,
+	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type AcpStopReason,
 	type RpcId,
@@ -87,7 +90,23 @@ interface Connection {
 	proc: ChildProcess;
 	state: "starting" | "ready";
 	session: Promise<string> | null;
+	/** Whether the current session has received a prompt (and so has history). */
+	sessionUsed: boolean;
+	/** Settings of every session this process created, by session id. */
+	configs: Map<string, AcpSessionConfig>;
 }
+
+export interface EnsureSessionOptions {
+	signal?: AbortSignal | undefined;
+	/**
+	 * Whether `auth_required` may trigger the configured `authenticate` method.
+	 * Background work turns it off, since a method may wait on a browser login.
+	 */
+	authenticate?: boolean;
+}
+
+/** The session settings Pi controls. */
+export type SessionSetting = keyof AcpSessionConfig;
 
 interface PendingRequest {
 	resolve: (result: unknown) => void;
@@ -184,21 +203,57 @@ export class AcpClient {
 	}
 
 	/** Returns the current ACP session, creating one (and the process) on demand. */
-	async ensureSession(signal?: AbortSignal): Promise<string> {
+	async ensureSession({ signal, authenticate = true }: EnsureSessionOptions = {}): Promise<string> {
 		await this.ensureReady(signal);
 		const conn = this.conn;
 		if (!conn) throw new Error(`${this.options.agent.name} is not running`);
-		conn.session ??= this.newSession().catch((error: unknown) => {
+		conn.session ??= this.newSession(conn, authenticate).catch((error: unknown) => {
 			conn.session = null;
 			throw error;
 		});
 		return abortable(conn.session, signal);
 	}
 
-	/** Forgets the current session; the next `ensureSession` creates one in `cwd`. */
+	/** The models and reasoning levels a live session offers. */
+	sessionConfig(sessionId: string): AcpSessionConfig | undefined {
+		return this.conn?.configs.get(sessionId);
+	}
+
+	/**
+	 * Changes the session's model or reasoning level, via
+	 * `session/set_config_option` or the legacy `session/set_model`.
+	 */
+	async setSessionSetting(sessionId: string, setting: SessionSetting, value: string, signal?: AbortSignal): Promise<void> {
+		const conn = this.conn;
+		const select = conn?.configs.get(sessionId)?.[setting];
+		if (!conn || !select) throw new Error(`${this.options.agent.name} offers no ${setting} setting for this session`);
+		if (select.currentValue === value) return;
+		const timeout = this.options.handshakeTimeoutMs;
+		if (select.configId === null) {
+			await abortable(this.request("session/set_model", { sessionId, modelId: value }, timeout), signal);
+			const config = conn.configs.get(sessionId);
+			if (config?.model) config.model = { ...config.model, currentValue: value };
+			return;
+		}
+		const result = await abortable(
+			this.request("session/set_config_option", { sessionId, configId: select.configId, value }, timeout),
+			signal,
+		);
+		const previous = conn.configs.get(sessionId);
+		if (previous) conn.configs.set(sessionId, parseSessionConfig(result, previous));
+	}
+
+	/**
+	 * Forgets the current session; the next `ensureSession` creates one in
+	 * `cwd`. An unused session in the same directory is kept: it has no
+	 * history, so it is as good as a new one.
+	 */
 	resetSession(cwd: string): void {
+		const unchanged = cwd === this.cwd;
 		this.cwd = cwd;
-		if (this.conn) this.conn.session = null;
+		if (!this.conn || (unchanged && !this.conn.sessionUsed)) return;
+		this.conn.session = null;
+		this.conn.sessionUsed = false;
 	}
 
 	/** Sends one `session/prompt` and resolves when the turn finishes or is aborted. */
@@ -212,6 +267,7 @@ export class AcpClient {
 			signal,
 		};
 		this.turn = turn;
+		if (this.conn) this.conn.sessionUsed = true;
 		try {
 			await this.draining;
 			if (signal?.aborted) return { kind: "aborted" };
@@ -246,16 +302,20 @@ export class AcpClient {
 	}
 
 	/** `session/new`, authenticating once with the configured method if the agent asks. */
-	private async newSession(): Promise<string> {
-		const create = async () =>
-			parseNewSessionResult(
+	private async newSession(conn: Connection, authenticate: boolean): Promise<string> {
+		const create = async () => {
+			const result = parseNewSessionResult(
 				await this.request("session/new", { cwd: this.cwd, mcpServers: [] }, this.options.handshakeTimeoutMs),
 			);
+			conn.configs.set(result.sessionId, result.config);
+			return result.sessionId;
+		};
 		try {
 			return await create();
 		} catch (error) {
 			const { authMethod } = this.options.agent;
-			if (!(error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED) || !authMethod) throw error;
+			const authRequired = error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED;
+			if (!authRequired || !authMethod || !authenticate) throw error;
 			this.log(`authenticating with method '${authMethod}'`);
 			// No timeout: methods may wait on an interactive login (e.g. a browser).
 			await this.request("authenticate", { methodId: authMethod });
@@ -272,12 +332,19 @@ export class AcpClient {
 					protocolVersion: ACP_PROTOCOL_VERSION,
 					// Agents use their own file and terminal tools.
 					clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-					clientInfo: { name: "pi-acp-provider", version: "1.0.0" },
+					clientInfo: { name: "pi-acp-provider", version: "1.1.0" },
 				},
 				this.options.handshakeTimeoutMs,
 			);
+			const info = parseInitializeResult(result);
+			// The agent answers with the version it will speak; we only speak v1.
+			if (info.protocolVersion !== ACP_PROTOCOL_VERSION) {
+				throw new Error(
+					`${this.options.agent.name} speaks ACP v${info.protocolVersion}; pi-acp-provider supports v${ACP_PROTOCOL_VERSION}.`,
+				);
+			}
 			conn.state = "ready";
-			this.agentInfo = parseInitializeResult(result);
+			this.agentInfo = info;
 			return this.agentInfo;
 		} catch (error) {
 			this.close(conn, error instanceof Error ? error : new Error(String(error)));
@@ -294,7 +361,7 @@ export class AcpClient {
 			// Own process group, so the whole tree can be killed at once.
 			detached: !IS_WINDOWS,
 		});
-		const conn: Connection = { proc, state: "starting", session: null };
+		const conn: Connection = { proc, state: "starting", session: null, sessionUsed: false, configs: new Map() };
 		this.conn = conn;
 		this.installParentHooks();
 
@@ -439,6 +506,13 @@ export class AcpClient {
 	}
 
 	private dispatchUpdate(params: unknown): void {
+		// Settings can change outside a turn (e.g. the agent's own `/model`).
+		const configUpdate = configOptionUpdate(params);
+		const configs = this.conn?.configs;
+		if (configUpdate && configs && isRecord(params) && typeof params.sessionId === "string") {
+			const previous = configs.get(params.sessionId);
+			if (previous) configs.set(params.sessionId, parseSessionConfig(configUpdate, previous));
+		}
 		const turn = this.turn;
 		if (!turn || !isRecord(params) || params.sessionId !== turn.sessionId) return;
 		turn.onRawUpdate?.(params);

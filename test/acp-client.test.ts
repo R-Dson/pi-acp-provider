@@ -60,7 +60,10 @@ test("session is created once and reused", async () => {
 	const [first, second] = await Promise.all([client.ensureSession(), client.ensureSession()]);
 	assert.equal(first, second);
 	client.resetSession(process.cwd());
-	assert.notEqual(await client.ensureSession(), first);
+	assert.equal(await client.ensureSession(), first, "an unused session in the same cwd is kept");
+	await runPrompt(client, "use it");
+	client.resetSession(process.cwd());
+	assert.notEqual(await client.ensureSession(), first, "a used session is replaced");
 });
 
 test("spec-shaped session updates stream in order and the turn finishes", async () => {
@@ -181,4 +184,10 @@ test("parseRpcMessage classifies JSON-RPC shapes", () => {
 	});
 	assert.equal(parseRpcMessage({ jsonrpc: "2.0", id: 3 }), null);
 	assert.equal(parseRpcMessage([1, 2]), null);
+});
+
+test("an agent answering with an unsupported protocol version is rejected", async () => {
+	const client = makeClient({ agent: { env: { FAKE_PROTOCOL: "2" } } });
+	await assert.rejects(client.ensureReady(), /speaks ACP v2; pi-acp-provider supports v1/);
+	assert.equal(client.state, "uninitialized");
 });

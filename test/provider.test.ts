@@ -253,3 +253,105 @@ test("aborting while a permission prompt is open answers it as cancelled", async
 	assert.ok(policySignal?.aborted);
 	assert.equal((await lastEvent(handle, "next turn"))?.type, "done");
 });
+
+function modelsAgent(mode: "config" | "legacy"): AcpAgentConfig {
+	return fakeAgent({ env: { FAKE_MODELS: mode } });
+}
+
+function storeContext(stored?: { models: readonly unknown[] }) {
+	let published: { models: readonly unknown[] } | undefined;
+	const context = {
+		allowNetwork: true,
+		signal: new AbortController().signal,
+		...(stored ? { stored } : {}),
+		publish: async (publication: { persist?: { models: readonly unknown[] } | null; update?: () => void }) => {
+			published = publication.persist ?? undefined;
+			publication.update?.();
+			return true;
+		},
+	};
+	return { context: context as never, persisted: () => published };
+}
+
+test("discovery lists the agent's models, grouped options flattened", async () => {
+	const handle = makeProvider([modelsAgent("config")]);
+	const { context, persisted } = storeContext();
+	await handle.provider.refreshModels?.(context);
+	const models = handle.provider.getModels();
+	assert.deepEqual(
+		models.map((model) => [model.id, model.name]),
+		[
+			["fake", "Fake agent"],
+			["fake/fast", "Fast (Fake agent)"],
+			["fake/smart", "Smart (Fake agent)"],
+		],
+	);
+	assert.equal(models[1]?.reasoning, true);
+	assert.deepEqual(models[1]?.thinkingLevelMap, {
+		off: "none",
+		minimal: null,
+		low: "low",
+		medium: "medium",
+		high: "high",
+		xhigh: null,
+		max: null,
+	});
+	assert.equal(persisted()?.models.length, 3);
+});
+
+test("picking a discovered model and thinking level switches the session", async () => {
+	const handle = makeProvider([modelsAgent("config")]);
+	await handle.provider.refreshModels?.(storeContext().context);
+	const smart = handle.provider.getModels().find((model) => model.id === "fake/smart");
+	assert.ok(smart);
+	const first = await collect(handle.provider.streamSimple(smart, userContext("hi"), { reasoning: "high" }));
+	const done = first.at(-1);
+	assert.ok(done?.type === "done");
+	assert.match(messageText(done.message), /\[model=smart thought=high\]/);
+	// The bare agent model goes back to the agent's default; no reasoning means off.
+	const back = await lastEvent(handle, "again", firstModel(handle));
+	assert.ok(back?.type === "done");
+	assert.match(messageText(back.message), /\[model=fast thought=none\]/);
+});
+
+test("legacy models API is discovered and switched with session/set_model", async () => {
+	const handle = makeProvider([modelsAgent("legacy")]);
+	await handle.provider.refreshModels?.(storeContext().context);
+	const ids = handle.provider.getModels().map((model) => model.id);
+	assert.deepEqual(ids, ["fake", "fake/fast", "fake/smart"]);
+	const smart = handle.provider.getModels()[2];
+	assert.ok(smart && !smart.reasoning);
+	const last = await lastEvent(handle, "hi", smart);
+	assert.ok(last?.type === "done");
+	assert.match(messageText(last.message), /\[model=smart/);
+});
+
+test("a model the agent does not offer fails with the available list", async () => {
+	const handle = makeProvider([modelsAgent("config")]);
+	const last = await lastEvent(handle, "hi", { ...firstModel(handle), id: "fake/ghost" });
+	assert.ok(last?.type === "error");
+	assert.match(last.error.errorMessage ?? "", /does not offer model 'ghost'. Available: fast, smart/);
+});
+
+test("stored models are restored without spawning when network is not allowed", async () => {
+	const discovered = makeProvider([modelsAgent("config")]);
+	const first = storeContext();
+	await discovered.provider.refreshModels?.(first.context);
+	const stored = first.persisted();
+	assert.ok(stored);
+
+	const offline = makeProvider([fakeAgent({ command: "/nonexistent/agent" })]);
+	const { context } = storeContext(stored);
+	await offline.provider.refreshModels?.({ ...(context as object), allowNetwork: false } as never);
+	assert.deepEqual(
+		offline.provider.getModels().map((model) => model.id),
+		["fake", "fake/fast", "fake/smart"],
+	);
+	assert.equal(offline.provider.getModels()[1]?.thinkingLevelMap?.high, "high");
+});
+
+test("agents without model support list only their default model after discovery", async () => {
+	const handle = makeProvider();
+	await handle.provider.refreshModels?.(storeContext().context);
+	assert.deepEqual(handle.provider.getModels().map((model) => model.id), ["fake"]);
+});

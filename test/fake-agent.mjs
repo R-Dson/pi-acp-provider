@@ -10,6 +10,10 @@
  *   - "MAXTOKENS"   finishes with stopReason "max_tokens"
  *   - "REFUSAL"     finishes with stopReason "refusal"
  *   - FAKE_SPLIT=1  writes stdout in small split chunks (line-buffer test)
+ *   - FAKE_MODELS=config  session/new returns configOptions (model + thought_level)
+ *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
+ *                   Replies end with "[model=<id> thought=<level>]".
+ *   - FAKE_PROTOCOL=n answers initialize with protocol version n
  *   - FAKE_AUTH=1   session/new fails with auth_required until `authenticate`
  *                   is called with methodId "fake-login"
  */
@@ -35,6 +39,36 @@ const replyError = (id, code, message) => emit({ jsonrpc: "2.0", id, error: { co
 const update = (sessionId, sessionUpdate) =>
 	emit({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: sessionUpdate } });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const MODELS = process.env.FAKE_MODELS;
+const settings = { model: "fast", thought: "medium" };
+const configOptions = () => [
+	{
+		id: "model",
+		name: "Model",
+		category: "model",
+		type: "select",
+		currentValue: settings.model,
+		options: [
+			{ group: "main", name: "Main", options: [{ value: "fast", name: "Fast" }] },
+			{ value: "smart", name: "Smart", description: "Slow but clever" },
+		],
+	},
+	{
+		id: "effort",
+		name: "Reasoning",
+		category: "thought_level",
+		type: "select",
+		currentValue: settings.thought,
+		options: ["none", "low", "medium", "high"].map((value) => ({ value, name: value })),
+	},
+];
+const sessionExtras = () =>
+	MODELS === "config"
+		? { configOptions: configOptions() }
+		: MODELS === "legacy"
+			? { models: { currentModelId: settings.model, availableModels: [{ modelId: "fast", name: "Fast" }, { modelId: "smart", name: "Smart" }] } }
+			: {};
 
 let sessionCounter = 0;
 let promptCounter = 0;
@@ -97,7 +131,7 @@ async function handlePrompt(message) {
 		{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello " } },
 		{
 			sessionUpdate: "agent_message_chunk",
-			content: { type: "text", text: `world #${promptCounter}${approved !== null ? ` [approved=${approved}]` : ""}` },
+			content: { type: "text", text: `world #${promptCounter}${approved !== null ? ` [approved=${approved}]` : ""}${MODELS ? ` [model=${settings.model} thought=${settings.thought}]` : ""}` },
 		},
 	];
 	for (const step of steps) {
@@ -126,7 +160,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 	switch (message.method) {
 		case "initialize":
 			reply(message.id, {
-				protocolVersion: 1,
+				protocolVersion: Number(process.env.FAKE_PROTOCOL ?? 1),
 				agentCapabilities: { loadSession: false },
 				agentInfo: { name: `fake-agent-${process.pid}`, version: "0.0.1" },
 				authMethods: [{ id: "fake-login", name: "Fake login", description: "Pretend to sign in" }],
@@ -142,7 +176,24 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		case "session/new":
 			if (!authenticated) replyError(message.id, -32000, "Authentication required");
-			else reply(message.id, { sessionId: `sess-${++sessionCounter}` });
+			else reply(message.id, { sessionId: `sess-${++sessionCounter}`, ...sessionExtras() });
+			break;
+		case "session/set_config_option": {
+			const { configId, value } = message.params;
+			if (MODELS !== "config" || (configId !== "model" && configId !== "effort")) {
+				replyError(message.id, -32602, "unknown config option");
+				break;
+			}
+			settings[configId === "model" ? "model" : "thought"] = value;
+			reply(message.id, { configOptions: configOptions() });
+			break;
+		}
+		case "session/set_model":
+			if (MODELS !== "legacy") replyError(message.id, -32601, "Method not found");
+			else {
+				settings.model = message.params.modelId;
+				reply(message.id, {});
+			}
 			break;
 		case "session/prompt":
 			void handlePrompt(message);

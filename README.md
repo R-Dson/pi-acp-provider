@@ -29,12 +29,12 @@ in the session working directory.
 ## Install
 
 ```bash
-git clone <this repo> ~/.pi/agent/extensions/acp
-cd ~/.pi/agent/extensions/acp
-npm install            # devDependencies provide types; runtime needs no extra packages
+pi install npm:pi-acp-provider
 ```
 
-Or try it directly: `pi --extension /path/to/pi-acp-provider/src/index.ts`.
+Or from git: `pi install git:github.com/R-Dson/pi-acp-provider`.
+
+To try it for one session without installing: `pi -e npm:pi-acp-provider`.
 
 ## Configuration
 
@@ -56,6 +56,21 @@ becomes a model: `/model acp/<key>`.
 The commands above are examples. Check each agent's documentation for the
 flag that starts its ACP mode. With no agents configured, Pi shows a warning at
 startup and the provider has no models.
+
+### Models and thinking level
+
+Models are discovered automatically. When Pi refreshes its model list (at
+interactive startup and whenever `/model` opens), each agent is started and an
+ACP session is opened to read the models it offers. They show up as
+`acp/<key>/<model id>`, e.g. `/model acp/copilot/gpt-5`. `acp/<key>` keeps the
+agent's own default. The list is saved, so `pi -p` and offline startups use the
+last one found.
+
+Both the ACP `configOptions` model selector and the older `models` /
+`session/set_model` API are supported. If the agent exposes a `thought_level`
+option, Pi's thinking level (`shift+tab`, `--thinking`) is applied to it; levels
+the agent doesn't offer are hidden. Discovery never triggers `authMethod`
+sign-in; that waits for the first prompt.
 
 Per-agent keys:
 

@@ -1,6 +1,12 @@
 /**
- * The `acp` provider: a Pi `Provider` with one model per configured ACP agent
- * (`acp/<agent id>`), each delegating the whole agent loop to that agent.
+ * The `acp` provider: a Pi `Provider` whose models delegate the whole agent
+ * loop to configured ACP agents.
+ *
+ * Each agent is the model `acp/<agent id>`, which runs with the agent's own
+ * default model. Models the agent offers are discovered by opening a session
+ * (`refreshModels`) and listed as `acp/<agent id>/<model id>`; picking one
+ * switches the session to it before the prompt is sent. Pi's thinking level
+ * maps onto the agent's `thought_level` setting when it has one.
  *
  * ACP agents execute their own tools and keep conversation history
  * server-side, so each Pi model turn sends only the newest user message and
@@ -8,22 +14,28 @@
  * no per-turn token usage, so usage is zero.
  */
 
-import type {
-	Api,
-	AssistantMessage,
-	AssistantMessageEventStream,
-	Model,
-	Provider,
-	StreamOptions,
-	TranscriptContext,
-	Usage,
+import {
+	createAssistantMessageEventStream,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Model,
+	type ModelThinkingLevel,
+	type Provider,
+	type RefreshModelsContext,
+	type SimpleStreamOptions,
+	type StreamOptions,
+	type ThinkingLevelMap,
+	type TranscriptContext,
+	type Usage,
 } from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { AcpClient, AcpRpcError, RPC_INVALID_PARAMS, RPC_METHOD_NOT_FOUND, type ServerRequest } from "./acp-client.ts";
 import {
 	ACP_AUTH_REQUIRED,
 	autoApprove,
 	type AcpAgentInfo,
+	type AcpSelect,
+	type AcpSessionConfig,
 	parsePermissionRequest,
 	type AcpPermissionOutcome,
 	type AcpPermissionRequest,
@@ -35,19 +47,57 @@ import type { AcpAgentConfig, AcpProviderConfig } from "./config.ts";
 export const ACP_PROVIDER_ID = "acp";
 const ACP_API = "acp";
 
-function agentModel(agent: AcpAgentConfig): Model<typeof ACP_API> {
+const PI_THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** Agent values that also mean "off". */
+const OFF_ALIASES = ["off", "none", "disabled"];
+
+/**
+ * Maps Pi thinking levels onto the agent's `thought_level` values by name
+ * (case-insensitive); levels the agent lacks are marked unsupported.
+ */
+function thinkingLevelMap(thoughtLevel: AcpSelect): ThinkingLevelMap {
+	const find = (names: string[]) =>
+		thoughtLevel.choices.find((choice) => names.includes(choice.value.toLowerCase()))?.value ?? null;
+	return Object.fromEntries(
+		PI_THINKING_LEVELS.map((level) => [level, find(level === "off" ? OFF_ALIASES : [level])]),
+	) as ThinkingLevelMap;
+}
+
+function baseModel(id: string, name: string, agent: AcpAgentConfig, thinking: ThinkingLevelMap | undefined): Model<typeof ACP_API> {
 	return {
-		id: agent.id,
-		name: agent.name,
+		id,
+		name,
 		api: ACP_API,
 		provider: ACP_PROVIDER_ID,
 		baseUrl: `stdio://${agent.id}`, // Unused: the transport is a child process.
-		reasoning: true,
+		reasoning: thinking !== undefined,
+		...(thinking ? { thinkingLevelMap: thinking } : {}),
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
 	};
+}
+
+/** The agent's default model, then one model per model its session offers. */
+export function agentModels(agent: AcpAgentConfig, config?: AcpSessionConfig): Model<typeof ACP_API>[] {
+	const thinking = config?.thoughtLevel && thinkingLevelMap(config.thoughtLevel);
+	return [
+		baseModel(agent.id, agent.name, agent, thinking),
+		...(config?.model?.choices ?? []).map((choice) =>
+			baseModel(`${agent.id}/${choice.value}`, `${choice.name} (${agent.name})`, agent, thinking),
+		),
+	];
+}
+
+/** Splits `<agent id>/<model id>`; a bare agent id selects the agent's default model. */
+function parseModelId(id: string, agents: ReadonlyMap<string, AcpAgentConfig>) {
+	const agent = agents.get(id);
+	if (agent) return { agent, modelId: undefined };
+	const slash = id.indexOf("/");
+	if (slash < 0) return undefined;
+	const owner = agents.get(id.slice(0, slash));
+	return owner ? { agent: owner, modelId: id.slice(slash + 1) } : undefined;
 }
 
 const zeroUsage = (): Usage => ({
@@ -197,7 +247,13 @@ function authHint(agent: AcpAgentConfig, info: AcpAgentInfo | null): string {
 export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandle {
 	const policy: PermissionPolicy = options.permissionPolicy ?? (async (request) => autoApprove(request));
 	const agents = new Map(options.config.agents.map((agent) => [agent.id, agent]));
-	const models = options.config.agents.map(agentModel);
+	/** Each agent's models from discovery (or the persisted catalog); default model only until then. */
+	const discovered = new Map<string, Model<Api>[]>();
+	const buildModels = () =>
+		options.config.agents.flatMap((agent) => discovered.get(agent.id) ?? agentModels(agent));
+	let models = buildModels();
+	/** Each agent's model when its current session started: what `acp/<agent id>` means. */
+	const sessionDefaults = new Map<string, string | undefined>();
 	let cwd = process.cwd();
 	/** One agent process per model, spawned on first use. */
 	const clients = new Map<string, AcpClient>();
@@ -250,11 +306,12 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			timestamp: Date.now(),
 		};
 		const writer = createMessageWriter(stream, message);
-		const agent = agents.get(model.id);
-		if (!agent) {
+		const target = parseModelId(model.id, agents);
+		if (!target) {
 			writer.fail("error", `Unknown ACP agent '${model.id}'. Configure it under "acp.agents" in ~/.pi/agent/settings.json.`);
 			return;
 		}
+		const { agent } = target;
 		const acp = getClient(agent);
 		const abortedOrError = (error: unknown): void => {
 			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
@@ -272,7 +329,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		// Setup failures (spawn, handshake, session) end the stream before `start`.
 		let sessionId: string;
 		try {
-			sessionId = await acp.ensureSession(signal);
+			sessionId = await acp.ensureSession({ signal });
+			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions);
 		} catch (error) {
 			abortedOrError(error);
 			return;
@@ -321,6 +379,71 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
+	/** Switches the session to the chosen model and Pi's thinking level, when the agent supports them. */
+	async function applySettings(
+		acp: AcpClient,
+		agent: AcpAgentConfig,
+		sessionId: string,
+		modelId: string | undefined,
+		model: Model<Api>,
+		streamOptions: StreamOptions | undefined,
+	): Promise<void> {
+		const signal = streamOptions?.signal;
+		const config = acp.sessionConfig(sessionId);
+		if (!sessionDefaults.has(sessionId)) sessionDefaults.set(sessionId, config?.model?.currentValue);
+		const wantedModel = modelId ?? sessionDefaults.get(sessionId);
+		if (wantedModel !== undefined && config?.model) {
+			if (modelId !== undefined && !config.model.choices.some((choice) => choice.value === modelId)) {
+				const offered = config.model.choices.map((choice) => choice.value).join(", ");
+				throw new Error(`${agent.name} does not offer model '${modelId}'. Available: ${offered || "none"}.`);
+			}
+			await acp.setSessionSetting(sessionId, "model", wantedModel, signal);
+		} else if (modelId !== undefined) {
+			throw new Error(`${agent.name} does not support choosing a model over ACP.`);
+		}
+
+		// Re-read: switching models can change the offered reasoning levels.
+		const thoughtLevel = acp.sessionConfig(sessionId)?.thoughtLevel;
+		if (!thoughtLevel) return;
+		const level: ModelThinkingLevel = (streamOptions as SimpleStreamOptions | undefined)?.reasoning ?? "off";
+		const value = model.thinkingLevelMap?.[level] ?? thinkingLevelMap(thoughtLevel)[level];
+		if (typeof value !== "string" || !thoughtLevel.choices.some((choice) => choice.value === value)) {
+			options.log?.(`${agent.id}: no thought_level value for thinking level '${level}'; keeping the agent's setting`);
+			return;
+		}
+		await acp.setSessionSetting(sessionId, "thoughtLevel", value, signal);
+	}
+
+	/** Lists one agent's models from a (possibly new) session, without interactive sign-in. */
+	async function discoverAgent(agent: AcpAgentConfig, signal: AbortSignal): Promise<void> {
+		const acp = getClient(agent);
+		const sessionId = await acp.ensureSession({ signal, authenticate: false });
+		const config = acp.sessionConfig(sessionId);
+		if (!sessionDefaults.has(sessionId)) sessionDefaults.set(sessionId, config?.model?.currentValue);
+		discovered.set(agent.id, agentModels(agent, config));
+	}
+
+	/** Restores the persisted catalog, then rediscovers every agent; failed agents keep their old list. */
+	const refreshModels = async (context: RefreshModelsContext): Promise<void> => {
+		const restored = new Map<string, Model<Api>[]>();
+		for (const model of context.stored?.models ?? []) {
+			const owner = parseModelId(model.id, agents)?.agent.id;
+			if (owner && !discovered.has(owner)) restored.set(owner, [...(restored.get(owner) ?? []), model as Model<Api>]);
+		}
+		for (const [owner, list] of restored) discovered.set(owner, list);
+		if (context.allowNetwork) {
+			await Promise.all(
+				options.config.agents.map((agent) =>
+					discoverAgent(agent, context.signal).catch((error: unknown) =>
+						options.log?.(`${agent.id}: model discovery failed: ${errorMessage(error)}`),
+					),
+				),
+			);
+		}
+		const next = buildModels();
+		await context.publish({ persist: { models: next, checkedAt: Date.now() }, update: () => (models = next) });
+	};
+
 	const stream = (
 		model: Model<Api>,
 		context: TranscriptContext,
@@ -345,6 +468,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			},
 		},
 		getModels: () => models,
+		refreshModels,
 		stream,
 		streamSimple: stream,
 	};

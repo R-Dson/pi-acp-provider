@@ -84,6 +84,12 @@ export interface AcpSessionNotification {
 	update: AcpSessionUpdate;
 }
 
+/** `config_option_update` params' full configOptions snapshot, or null for other updates. */
+export function configOptionUpdate(params: unknown): unknown {
+	if (!isRecord(params) || !isRecord(params.update)) return null;
+	return params.update.sessionUpdate === "config_option_update" ? params.update : null;
+}
+
 function parseToolCallStatus(value: unknown): ToolCallStatus | undefined {
 	switch (value) {
 		case "pending":
@@ -215,6 +221,8 @@ export interface AcpAuthMethod {
 }
 
 export interface AcpAgentInfo {
+	/** Negotiated protocol version from the `initialize` response. */
+	protocolVersion: number;
 	name: string;
 	version: string;
 	/** Methods the client may pass to `authenticate` when the agent reports `auth_required`. */
@@ -234,17 +242,101 @@ export function parseInitializeResult(result: unknown): AcpAgentInfo {
 	const record = isRecord(result) ? result : {};
 	const info = isRecord(record.agentInfo) ? record.agentInfo : {};
 	return {
+		protocolVersion: typeof record.protocolVersion === "number" ? record.protocolVersion : ACP_PROTOCOL_VERSION,
 		name: optionalString(info.name) ?? "unknown-agent",
 		version: optionalString(info.version) ?? "0.0.0",
 		authMethods: parseAuthMethods(record.authMethods),
 	};
 }
 
-export function parseNewSessionResult(result: unknown): string {
+// --- Session configuration (models, reasoning level) -------------------------
+
+export interface AcpChoice {
+	value: string;
+	name: string;
+	description: string | undefined;
+}
+
+/** A selectable session setting and how to change it. */
+export interface AcpSelect {
+	/**
+	 * `configId` for `session/set_config_option`; null for the legacy
+	 * `models` API, which uses `session/set_model`.
+	 */
+	configId: string | null;
+	currentValue: string | undefined;
+	choices: AcpChoice[];
+}
+
+/** The session settings the provider maps onto Pi; both are absent when the agent offers none. */
+export interface AcpSessionConfig {
+	model: AcpSelect | undefined;
+	/** `thought_level` config option: the agent's reasoning effort. */
+	thoughtLevel: AcpSelect | undefined;
+}
+
+export const emptySessionConfig = (): AcpSessionConfig => ({ model: undefined, thoughtLevel: undefined });
+
+/** Flattens a select option's `options`, which may be flat or grouped. */
+function parseChoices(value: unknown): AcpChoice[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((item): AcpChoice[] => {
+		if (!isRecord(item)) return [];
+		if (Array.isArray(item.options)) return parseChoices(item.options);
+		if (typeof item.value !== "string") return [];
+		return [{ value: item.value, name: optionalString(item.name) ?? item.value, description: optionalString(item.description) }];
+	});
+}
+
+/** The `select` config option of `category`, from a `configOptions` array. */
+function findSelect(configOptions: unknown, category: string): AcpSelect | undefined {
+	if (!Array.isArray(configOptions)) return undefined;
+	for (const option of configOptions) {
+		if (!isRecord(option) || option.category !== category || option.type !== "select") continue;
+		if (typeof option.id !== "string") continue;
+		return { configId: option.id, currentValue: optionalString(option.currentValue), choices: parseChoices(option.options) };
+	}
+	return undefined;
+}
+
+/** Legacy (pre-config-options) `models: { availableModels, currentModelId }`. */
+function parseLegacyModels(value: unknown): AcpSelect | undefined {
+	if (!isRecord(value) || !Array.isArray(value.availableModels)) return undefined;
+	const choices = value.availableModels.flatMap((model): AcpChoice[] =>
+		isRecord(model) && typeof model.modelId === "string"
+			? [{ value: model.modelId, name: optionalString(model.name) ?? model.modelId, description: optionalString(model.description) }]
+			: [],
+	);
+	return { configId: null, currentValue: optionalString(value.currentModelId), choices };
+}
+
+/**
+ * Reads models and reasoning level from a `session/new` or
+ * `session/set_config_option` result (or a `config_option_update`).
+ * `configOptions` wins over the legacy `models` field when both are present.
+ */
+export function parseSessionConfig(result: unknown, previous: AcpSessionConfig = emptySessionConfig()): AcpSessionConfig {
+	if (!isRecord(result)) return previous;
+	const hasConfigOptions = Array.isArray(result.configOptions);
+	// A legacy model list only changes through `session/set_model`, so a
+	// configOptions snapshot without a model option leaves it in place.
+	const keptModel = !hasConfigOptions || previous.model?.configId === null ? previous.model : undefined;
+	return {
+		model: findSelect(result.configOptions, "model") ?? parseLegacyModels(result.models) ?? keptModel,
+		thoughtLevel: hasConfigOptions ? findSelect(result.configOptions, "thought_level") : previous.thoughtLevel,
+	};
+}
+
+export interface AcpNewSession {
+	sessionId: string;
+	config: AcpSessionConfig;
+}
+
+export function parseNewSessionResult(result: unknown): AcpNewSession {
 	if (!isRecord(result) || typeof result.sessionId !== "string" || result.sessionId.length === 0) {
 		throw new Error("session/new did not return a sessionId");
 	}
-	return result.sessionId;
+	return { sessionId: result.sessionId, config: parseSessionConfig(result) };
 }
 
 export type AcpStopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
