@@ -329,6 +329,18 @@ test("picking a discovered model and thinking level switches the session", async
 	assert.match(messageText(back.message), /\[model=fast thought=none\]/);
 });
 
+test("a reasoning option in the \"thinking\" category (Mistral Vibe) gives thinking levels", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config", FAKE_THOUGHT_CATEGORY: "thinking" } })]);
+	await handle.provider.refreshModels?.(storeContext().context);
+	const smart = handle.provider.getModels().find((model) => model.id === "fake/smart");
+	assert.ok(smart?.reasoning);
+	assert.equal(smart.thinkingLevelMap?.high, "high");
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }];
+	const done = (await collect(handle.provider.streamSimple(smart, normalizeContext({ messages }), { reasoning: "high" }))).at(-1);
+	assert.ok(done?.type === "done");
+	assert.match(messageText(done.message), /\[model=smart thought=high\]/);
+});
+
 test("each agent's bare model keeps its own session default, even when session ids collide", async () => {
 	const handle = makeProvider([
 		fakeAgent({ env: { FAKE_MODELS: "config", FAKE_DEFAULT_MODEL: "smart" } }),

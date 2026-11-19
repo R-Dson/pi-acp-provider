@@ -15,6 +15,7 @@
  *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
  *                   Replies end with "[model=<id> thought=<level>]".
  *     FAKE_DEFAULT_MODEL=<id>  the model new sessions start on (default "fast")
+ *     FAKE_THOUGHT_CATEGORY=<c>  category of the reasoning option (default "thought_level")
  *   - "/context"    (whole prompt) answers like an agent slash command
  *   - FAKE_PROTOCOL=n answers initialize with protocol version n
  *   - FAKE_AUTH=1   session/new fails with auth_required until `authenticate`
@@ -60,7 +61,7 @@ const configOptions = () => [
 	{
 		id: "effort",
 		name: "Reasoning",
-		category: "thought_level",
+		category: process.env.FAKE_THOUGHT_CATEGORY ?? "thought_level",
 		type: "select",
 		currentValue: settings.thought,
 		options: ["none", "low", "medium", "high"].map((value) => ({ value, name: value })),
