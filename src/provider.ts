@@ -73,19 +73,22 @@ import { ACP_PROVIDER_ID, createModelCatalog, parseModelId } from "./models.ts";
 import { PiMcpServer, toMcpTool, type McpCall, type McpCallResult, type McpContent, type McpTool } from "./mcp-server.ts";
 import { ACP_TOOL_NAME, compactInput, type AcpToolArgs, type AcpToolState, type AwaitTool } from "./native-tools.ts";
 import {
-	conversation,
-	messageKey,
-	renderTranscript,
-	tagged,
-	transcriptOf,
-	userBlocks,
-	type AcpContentBlock,
-} from "./transcript.ts";
+	MAX_STEER_REJECTIONS,
+	PendingSteers,
+	buildPromptBlocks,
+	diverged,
+	keepConfirmed,
+	newSyncState,
+	noteStreamed,
+	partsIn,
+	requestUsers,
+	tailStart,
+	type PromptPart,
+	type SyncState,
+} from "./session-sync.ts";
+import { conversation, messageKey, renderTranscript, tagged, userBlocks, type AcpContentBlock } from "./transcript.ts";
 
 export { ACP_PROVIDER_ID } from "./models.ts";
-
-/** Rejections after which a steer is dropped rather than sent again. */
-const MAX_STEER_REJECTIONS = 2;
 
 /**
  * Tool names and titles agents give calls to Pi's MCP server, as observed:
@@ -136,80 +139,10 @@ function plainText(message: UserMessage): string {
 	return message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 }
 
-/** Put in front of user messages that reach the agent with a later prompt than the one meant to carry them. */
-const LATE_STEER_NOTE = "Delivered late: the user sent the following earlier, and it did not reach you then.";
-
 /** First line of tool output, capped so huge outputs don't flood the transcript. */
 function summarize(text: string, max = 200): string {
 	const line = text.trim().split("\n", 1)[0] ?? "";
 	return line.length > max ? `${line.slice(0, max)}…` : line;
-}
-
-/** Index after the last assistant message: where the messages Pi added since start. */
-function tailStart(messages: readonly Message[]): number {
-	for (let index = messages.length - 1; index >= 0; index--) if (messages[index]?.role === "assistant") return index + 1;
-	return 0;
-}
-
-/**
- * Index after the last assistant message that answered: where the users of the request Pi makes start.
- * An assistant message that ended in `error` answered nothing, so the users before it still wait for a
- * reply; the ones the session already got are filtered out as delivered. An `aborted` one counts as an
- * answer: the user stopped that request, so it must not run again.
- */
-function requestStart(messages: readonly Message[]): number {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const candidate = messages[index];
-		if (candidate?.role === "assistant" && candidate.stopReason !== "error") return index + 1;
-	}
-	return 0;
-}
-
-/** Blocks of a prompt and what sending them tells about the session, once the agent accepts it. */
-interface PromptPart {
-	blocks: AcpContentBlock[];
-	/** The blocks as sent, fixed before an `onPayload` hook can change them. */
-	sent: string[];
-	record: () => void;
-	/** What the prompt leaving the part out means, once the agent accepts it. */
-	omit: () => void;
-	/** Key of the pending steer the part carries. */
-	steer: string | undefined;
-}
-
-function promptPart(blocks: AcpContentBlock[], record: () => void, options: { omit?: () => void; steer?: string } = {}): PromptPart {
-	return { blocks, sent: blocks.map((block) => JSON.stringify(block)), record, omit: options.omit ?? (() => {}), steer: options.steer };
-}
-
-/**
- * The parts whose blocks all reach the agent in `payload`, which an `onPayload` hook may have replaced
- * or changed. A block the hook kept is recognized as the same object, unchanged. A block it rebuilt is
- * matched by value, but only when no other block of the prompt has that value, since it cannot tell
- * which of two identical blocks it stands for.
- * WARN: a part a hook rewrote, or an ambiguous one, counts as not sent: wrongly sending again is
- * recoverable, wrongly recording delivery loses the content.
- */
-function partsIn(parts: readonly PromptPart[], payload: unknown): PromptPart[] {
-	const prompt: unknown[] = isRecord(payload) && Array.isArray(payload.prompt) ? payload.prompt : [];
-	const ours = new Set<unknown>(parts.flatMap((part) => part.blocks));
-	const kept = new Set<unknown>();
-	const rebuilt = new Map<string, number>();
-	for (const block of prompt) {
-		if (ours.has(block)) kept.add(block);
-		else {
-			const text = JSON.stringify(block);
-			rebuilt.set(text, (rebuilt.get(text) ?? 0) + 1);
-		}
-	}
-	const owners = new Map<string, number>();
-	for (const text of parts.flatMap((part) => part.sent)) owners.set(text, (owners.get(text) ?? 0) + 1);
-	return parts.filter((part) =>
-		part.blocks.every((block, index) => {
-			const text = part.sent[index]!;
-			if (kept.has(block)) return JSON.stringify(block) === text;
-			return owners.get(text) === 1 && rebuilt.get(text) === 1;
-		}),
-	);
 }
 
 type TurnOutcome = { result: PromptResult } | { error: unknown; auth: AcpAgentInfo | null };
@@ -262,16 +195,28 @@ interface TurnPrompt {
 	steers: readonly string[];
 }
 
-/** A steering message no prompt the agent accepted has carried yet. */
-interface PendingSteer {
-	message: UserMessage;
-	key: string;
-	/** How many prompts carrying it the agent rejected. */
-	rejections: number;
-}
-
 /** One key from an agent id and a conversation or session id. */
 const turnKey = (agentId: string, id: string): string => `${agentId}\u0000${id}`;
+
+interface SessionRequest {
+	agent: AcpAgentConfig;
+	acp: AcpClient;
+	key: string;
+	conversationId: string;
+	modelId: string | undefined;
+	model: Model<Api>;
+	streamOptions: StreamOptions | undefined;
+	messages: readonly Message[];
+	systemPrompt: string;
+	signal: AbortSignal;
+}
+
+interface OpenedSession {
+	sessionId: string;
+	instance: SessionInstance | undefined;
+	state: SyncState;
+	info: AcpAgentInfo;
+}
 
 interface IsolatedRequest {
 	stream: AssistantMessageEventStream;
@@ -332,57 +277,6 @@ interface LiveTurn {
 	/** Told to the user when the turn ends in an error, after the error itself. */
 	notice: string | undefined;
 }
-
-/** What the provider knows one ACP session has seen of the Pi conversation. */
-interface SyncState {
-	/** Timestamps of the assistant messages this session streamed. */
-	ownStamps: Set<number>;
-	/** The newest of those seen in Pi's history: what the session has seen goes up to here. */
-	anchor: number | undefined;
-	/** Key of the first history message; compaction replaces it. */
-	first: string | undefined;
-	/** Tool call ids this session produced (mirrored and Pi calls): their results are not news to it. */
-	ours: Set<string>;
-	/** Keys of user messages already delivered (prompted, steered, or attached to a tool result). */
-	delivered: Set<string>;
-	/**
-	 * Keys of history messages the session accepted in a `<conversation-history>` seed. Kept apart from
-	 * `anchor`, which moves only past the session's own replies, so a seed of foreign history is not
-	 * sent again while no own reply follows it.
-	 */
-	seeded: Set<string>;
-	/**
-	 * Timestamp of the newest reply the session streamed to an end Pi keeps in context. Unlike `anchor`,
-	 * it covers the latest reply, so a fork that keeps an earlier one is still seen.
-	 * WHY: `error` replies are left out because Pi omits a retried one from context; `aborted` ones it keeps.
-	 */
-	lastStreamed: number | undefined;
-	/** Keys of the `seeded` messages the accepted seeds rendered: the ones the session actually read. */
-	shown: Set<string>;
-	/**
-	 * Keys of delivered users and `shown` messages that a later request still held, so Pi's history keeps
-	 * them; one missing means the history was edited.
-	 * WHY: a Pi `context` handler may add a message of any role for one request only, and nothing tells it
-	 * from persisted history, so a message counts only once it is seen again. An edit that drops one before
-	 * that goes unnoticed.
-	 */
-	kept: Set<string>;
-	/** The Pi system prompt the session last received. */
-	systemPrompt: string;
-}
-
-const newSyncState = (systemPrompt: string): SyncState => ({
-	ownStamps: new Set(),
-	anchor: undefined,
-	first: undefined,
-	ours: new Set(),
-	delivered: new Set(),
-	seeded: new Set(),
-	lastStreamed: undefined,
-	shown: new Set(),
-	kept: new Set(),
-	systemPrompt,
-});
 
 /** Renders tool activity as short inline notices in the reply text. */
 function createToolRenderer(append: (text: string) => void) {
@@ -461,12 +355,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * becomes the turn's `controller`. Aborting it supersedes the request, set up or not.
 	 */
 	const claims = new Map<string, AbortController>();
-	/**
-	 * Steers the agent has not accepted yet, and users an `onPayload` hook left out of an accepted prompt,
-	 * oldest first, by `LiveTurn.key`. Kept here rather than in a
-	 * `SyncState`, so they outlive a replaced or re-seeded session and reach its next prompt.
-	 */
-	const pendingSteers = new Map<string, PendingSteer[]>();
+	const pendingSteers = new PendingSteers();
 	// WARN: session ids repeat once an agent respawns, and a turn parked at a Pi tool call outlives its
 	// process; routing and sync lookups must match the session instance, never the id alone.
 	const isCurrent = (turn: LiveTurn): boolean => turn.instance !== undefined && turn.instance === turn.acp.instance(turn.sessionId);
@@ -673,60 +562,49 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 	}
 
-	/** Whether the session streamed `message` itself. */
-	function isOwnReply(state: SyncState, message: Message): boolean {
-		return message.role === "assistant" && message.provider === ACP_PROVIDER_ID && state.ownStamps.has(message.timestamp);
-	}
-
-	/** Whether the session produced `message`, or already received it. */
-	function isOwn(state: SyncState, message: Message): boolean {
-		if (isOwnReply(state, message) || state.seeded.has(messageKey(message))) return true;
-		if (message.role === "toolResult") return state.ours.has(message.toolCallId);
-		return message.role === "user" && state.delivered.has(messageKey(message));
-	}
-
-	const isPendingSteer = (owner: string, key: string): boolean =>
-		pendingSteers.get(owner)?.some((steer) => steer.key === key) === true;
-
-	/** Holds `steers` until a prompt carrying them is accepted. */
-	function holdSteers(owner: string, steers: readonly UserMessage[]): void {
-		const held = pendingSteers.get(owner) ?? [];
-		for (const message of steers) {
-			const key = messageKey(message);
-			if (!held.some((steer) => steer.key === key)) held.push({ message, key, rejections: 0 });
+	async function openSession(request: SessionRequest): Promise<OpenedSession> {
+		const { agent, acp, key, conversationId, modelId, model, streamOptions, messages, systemPrompt, signal } = request;
+		const server = await mcpServer(agent);
+		signal.throwIfAborted();
+		let promptInSession = false;
+		const setup = sessionSetup(agent, acp, server, key, systemPrompt, () => (promptInSession = true));
+		let sessionId = await acp.ensureSession({ signal, setup, conversation: conversationId });
+		let known = sync.get(turnKey(agent.id, sessionId));
+		// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
+		// down would never gain Pi's tools; a new session seeded from Pi's history does.
+		const rewired = wiringOf(acp).get(sessionId) !== setup.key;
+		if (rewired || (known && diverged(known, messages))) {
+			log?.(
+				rewired
+					? `${agent.id}: session ${sessionId} lacks Pi's tool wiring (${setup.key}); starting a new session`
+					: `${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`,
+			);
+			sync.delete(turnKey(agent.id, sessionId));
+			acp.resetSession(cwd, conversationId);
+			promptInSession = false;
+			sessionId = await acp.ensureSession({ signal, setup, conversation: conversationId });
+			known = undefined;
 		}
-		pendingSteers.set(owner, held);
+		const state = known ?? newSyncState(promptInSession ? systemPrompt : "");
+		sync.set(turnKey(agent.id, sessionId), state);
+		keepConfirmed(state, messages);
+		const info = acp.info ?? (await acp.ensureReady(signal));
+		const instance = acp.instance(sessionId);
+		await applySettings(acp, agent, sessionId, modelId, model, streamOptions, signal, instance);
+		signal.throwIfAborted();
+		return { sessionId, instance, state, info };
 	}
 
-	/** Records the steers `keys` as delivered to the session. */
-	function deliverSteers(owner: string, state: SyncState | undefined, keys: readonly string[]): void {
-		for (const key of keys) state?.delivered.add(key);
-		const held = pendingSteers.get(owner);
-		if (held) pendingSteers.set(owner, held.filter((steer) => !keys.includes(steer.key)));
-	}
-
-	/** Counts a rejection of the steers `keys`; returns the ones this rejection dropped. */
-	function rejectSteers(owner: string, keys: readonly string[]): PendingSteer[] {
-		const dropped: PendingSteer[] = [];
-		for (const steer of pendingSteers.get(owner) ?? []) {
-			if (!keys.includes(steer.key)) continue;
-			steer.rejections++;
-			if (steer.rejections === MAX_STEER_REJECTIONS) dropped.push(steer);
-		}
-		return dropped;
-	}
-
-	const isDropped = (steer: PendingSteer): boolean => steer.rejections >= MAX_STEER_REJECTIONS;
-
-	/**
-	 * The pending steers of the turn key `owner` still on Pi's active branch and undelivered to the session; forgets the rest.
-	 * WARN: dropped steers stay listed, unsent, so that they stay out of history seeds as well.
-	 */
-	function recoverSteers(owner: string, messages: readonly Message[], state: SyncState): PendingSteer[] {
-		const branch = new Set(messages.map(messageKey));
-		const kept = (pendingSteers.get(owner) ?? []).filter((steer) => branch.has(steer.key) && !state.delivered.has(steer.key));
-		pendingSteers.set(owner, kept);
-		return kept;
+	function rawUpdateHook(streamOptions: StreamOptions | undefined, model: Model<Api>): ((params: unknown) => void) | undefined {
+		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
+		return (
+			onProviderStreamEvent &&
+			((params: unknown) => {
+				Promise.resolve(onProviderStreamEvent(params, model)).catch((error: unknown) =>
+					log?.(`onProviderStreamEvent failed: ${errorMessage(error)}`),
+				);
+			})
+		);
 	}
 
 	async function runTurn(
@@ -783,10 +661,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		claims.get(key)?.abort();
 		claims.delete(key);
 		lives.delete(key);
-		const users = messages
-			.slice(requestStart(messages))
-			.filter((candidate): candidate is UserMessage => candidate.role === "user");
-		if (users.length === 0) {
+		if (requestUsers(messages).length === 0) {
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
 			return;
 		}
@@ -802,118 +677,44 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 
 		const systemPrompt = getCurrentSystemPrompt(context.messages);
-		// Setup failures (spawn, handshake, session) end the stream before `start`.
-		let sessionId: string;
-		let instance: SessionInstance | undefined;
-		let state: SyncState;
-		let info: AcpAgentInfo;
+		let opened: OpenedSession;
 		try {
-			const server = await mcpServer(agent);
-			setupSignal.throwIfAborted();
-			let promptInSession = false;
-			const setup = sessionSetup(agent, acp, server, key, systemPrompt, () => (promptInSession = true));
-			sessionId = await acp.ensureSession({ signal: setupSignal, setup, conversation: conversationId });
-			let known = sync.get(turnKey(agent.id, sessionId));
-			// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
-			// down would never gain Pi's tools; a new session seeded from Pi's history does.
-			const rewired = wiringOf(acp).get(sessionId) !== setup.key;
-			if (rewired || (known && diverged(known, messages))) {
-				log?.(
-					rewired
-						? `${agent.id}: session ${sessionId} lacks Pi's tool wiring (${setup.key}); starting a new session`
-						: `${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`,
-				);
-				sync.delete(turnKey(agent.id, sessionId));
-				acp.resetSession(cwd, conversationId);
-				promptInSession = false;
-				sessionId = await acp.ensureSession({ signal: setupSignal, setup, conversation: conversationId });
-				known = undefined;
-			}
-			state = known ?? newSyncState(promptInSession ? systemPrompt : "");
-			sync.set(turnKey(agent.id, sessionId), state);
-			keepConfirmed(state, messages);
-			info = acp.info ?? (await acp.ensureReady(setupSignal));
-			instance = acp.instance(sessionId);
-			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions, setupSignal, instance);
+			opened = await openSession({ agent, acp, key, conversationId, modelId: target.modelId, model, streamOptions, messages, systemPrompt, signal: setupSignal });
+			// WHY: the request can be superseded while this await resumes, after openSession's own check; it
+			// must then end before it prunes pending steers or starts the stream.
 			setupSignal.throwIfAborted();
 		} catch (error) {
 			abortedOrError(error);
 			return;
 		}
+		const { sessionId, instance, state, info } = opened;
 
-		const parts: PromptPart[] = [];
-		if (agent.systemPrompt !== "off" && systemPrompt !== "" && state.systemPrompt !== systemPrompt) {
-			const intro = state.systemPrompt
-				? "Pi, the host application you run in, updated its instructions. They replace the earlier ones:"
-				: "Instructions from Pi, the host application you run in. Follow them together with your own:";
-			parts.push(promptPart([tagged("system-instructions", systemPrompt, intro)], () => (state.systemPrompt = systemPrompt)));
-		}
-		const held = recoverSteers(key, messages, state);
-		const isHeld = (candidate: Message): boolean => held.some((steer) => steer.key === messageKey(candidate));
-		const late = held.filter((steer) => !isDropped(steer));
-		const requestUsers = new Set(users);
-		const history = messages.slice(0, messages.length - tail.length);
-		const anchorIndex = state.anchor === undefined ? -1 : history.findLastIndex((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
-		// WHY: pending steers and the users of an unanswered request are requests the agent never got, so
-		// they go as user blocks, never as history.
-		const unseen = history
-			.slice(anchorIndex + 1)
-			.filter((candidate) => !isOwn(state, candidate) && !isHeld(candidate) && !requestUsers.has(candidate as UserMessage));
-		/** How much of `history` the session holds once the prompt is accepted. */
-		let heldHistory = history.length;
-		const { text: transcript, shown } = transcriptOf(unseen);
-		if (transcript) {
-			const intro = "Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:";
-			parts.push(
-				promptPart(
-					[tagged("conversation-history", transcript, intro)],
-					() => {
-						for (const seen of unseen) state.seeded.add(messageKey(seen));
-						for (const seen of shown) state.shown.add(messageKey(seen));
-					},
-					// WHY: the anchor must stay before history the session never got, or later prompts skip it.
-					{ omit: () => (heldHistory = history.indexOf(unseen[0]!)) },
-				),
-			);
-		}
-		if (late.length > 0) parts.push(promptPart([{ type: "text", text: LATE_STEER_NOTE }], () => {}));
-		for (const steer of late) {
-			const record = (): void => deliverSteers(key, state, [steer.key]);
-			parts.push(promptPart(userBlocks(steer.message, info.capabilities.image), record, { steer: steer.key }));
-		}
-		const sendable = users.filter((user) => !isHeld(user));
-		const fresh = sendable.filter((user) => !state.delivered.has(messageKey(user)));
-		// WHY: with nothing new, the request is Pi retrying the last one; a recovered steer is new enough.
-		const sentUsers = fresh.length > 0 || late.length > 0 ? fresh : sendable.slice(-1);
-		if (sentUsers.length === 0 && late.length === 0) {
+		const prompt = buildPromptBlocks({
+			systemPromptMode: agent.systemPrompt,
+			systemPrompt,
+			state,
+			messages,
+			held: pendingSteers.recover(key, messages, state),
+			images: info.capabilities.image,
+			replyTimestamp: message.timestamp,
+			steers: pendingSteers,
+			owner: key,
+		});
+		if (!prompt) {
 			if (claims.get(key) === claim) claims.delete(key);
 			writer.fail("error", `No user message left to send to ${agent.name}.`);
 			return;
 		}
-		for (const user of sentUsers) {
-			// WHY: once the agent answers, a user the hook left out falls behind the reply and would reach the
-			// next prompt only as history; held, it goes as a late user block instead.
-			const omit = (): void => holdSteers(key, [user]);
-			parts.push(promptPart(userBlocks(user, info.capabilities.image), () => state.delivered.add(messageKey(user)), { omit }));
-		}
-		const blocks = parts.flatMap((part) => part.blocks);
 
 		stream.push({ type: "start", partial: message });
-		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
-		const onRawUpdate =
-			onProviderStreamEvent &&
-			((params: unknown) => {
-				Promise.resolve(onProviderStreamEvent(params, model)).catch((error: unknown) =>
-					log?.(`onProviderStreamEvent failed: ${errorMessage(error)}`),
-				);
-			});
+		const onRawUpdate = rawUpdateHook(streamOptions, model);
 		let payload: unknown;
 		let sent: PromptPart[];
 		try {
-			const defaultPayload = { sessionId, prompt: blocks };
+			const defaultPayload = { sessionId, prompt: prompt.blocks };
 			// WHY: a superseded request must end now, not once its hook returns.
 			payload = (await abortable(Promise.resolve(streamOptions?.onPayload?.(defaultPayload, model)), setupSignal)) ?? defaultPayload;
-			sent = partsIn(parts, payload);
+			sent = partsIn(prompt.parts, payload);
 			setupSignal.throwIfAborted();
 			// WHY: checked before the turn is published: while the hook ran, the agent may have restarted
 			// and handed this session id to another conversation's new session.
@@ -924,13 +725,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			abortedOrError(error);
 			return;
 		}
-		const commit = (): void => {
-			for (const part of parts) (sent.includes(part) ? part.record : part.omit)();
-			const newestOwn = history.slice(0, heldHistory).findLast((candidate) => isOwnReply(state, candidate));
-			if (newestOwn) state.anchor = newestOwn.timestamp;
-			state.first = messages[0] ? messageKey(messages[0]) : undefined;
-			state.ownStamps.add(message.timestamp);
-		};
 		const sentSteers = sent.flatMap((part) => (part.steer === undefined ? [] : [part.steer]));
 
 		const turn: LiveTurn = {
@@ -960,39 +754,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			notice: undefined,
 		};
 		lives.set(key, turn);
-		startPrompt(turn, { payload, commit, steers: sentSteers });
+		startPrompt(turn, { payload, commit: () => prompt.commit(sent), steers: sentSteers });
 		attach(turn, writer, signal);
-	}
-
-	/**
-	 * Whether Pi's history no longer holds what the session saw: the first message
-	 * changed (compaction), or a tree jump, fork or context edit dropped the
-	 * session's latest reply, the anchor, or accepted history in `kept`. Messages an
-	 * extension adds for one request only do not count.
-	 */
-	function diverged(state: SyncState, messages: readonly Message[]): boolean {
-		if (state.first !== undefined && messages[0] && messageKey(messages[0]) !== state.first) return true;
-		const hasReply = (timestamp: number): boolean =>
-			messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === timestamp);
-		if (state.anchor !== undefined && !hasReply(state.anchor)) return true;
-		if (state.lastStreamed !== undefined && !hasReply(state.lastStreamed)) return true;
-		const keys = new Set(messages.map(messageKey));
-		return [...state.kept].some((key) => !keys.has(key));
-	}
-
-	/** Adds to `kept` what earlier requests delivered or showed the session that Pi's history still holds. */
-	function keepConfirmed(state: SyncState, messages: readonly Message[]): void {
-		for (const message of messages) {
-			const key = messageKey(message);
-			if (state.delivered.has(key) || state.shown.has(key)) state.kept.add(key);
-		}
-	}
-
-	/** Records the turn's settled Pi message as the session's latest reply, if Pi keeps it in context. */
-	function noteStreamed(turn: LiveTurn, message: AssistantMessage): void {
-		const state = syncOf(turn);
-		if (!state?.ownStamps.has(message.timestamp) || message.stopReason === "error") return;
-		state.lastStreamed = message.timestamp;
 	}
 
 	/** Whether the messages Pi added answer tool calls of `turn`, so the same ACP turn goes on. */
@@ -1015,7 +778,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		);
 		const steers = tail.filter(
 			(candidate): candidate is UserMessage =>
-				candidate.role === "user" && !state?.delivered.has(messageKey(candidate)) && !isPendingSteer(turn.key, messageKey(candidate)),
+				candidate.role === "user" && !state?.delivered.has(messageKey(candidate)) && !pendingSteers.has(turn.key, messageKey(candidate)),
 		);
 		const steerKeys = steers.map(messageKey);
 		const image = turn.acp.info?.capabilities.image === true;
@@ -1026,7 +789,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!steerDelivered && turn.steering && turn.running) {
 			try {
 				steerDelivered = (await turn.acp.steer(turn.sessionId, steerBlocks)) === "steered";
-				if (steerDelivered) deliverSteers(turn.key, state, steerKeys);
+				if (steerDelivered) pendingSteers.deliver(turn.key, state, steerKeys);
 			} catch (error) {
 				log?.(`${turn.agent.id}: _session/steering failed, falling back: ${errorMessage(error)}`);
 			}
@@ -1050,15 +813,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					...images,
 				);
 				steerDelivered = true;
-				deliverSteers(turn.key, state, steerKeys);
+				pendingSteers.deliver(turn.key, state, steerKeys);
 			}
 			call.resolve(reply);
 		}
 		if (steerDelivered) return;
-		holdSteers(turn.key, steers);
+		pendingSteers.hold(turn.key, steers);
 		enqueuePrompt(turn, {
 			payload: { sessionId: turn.sessionId, prompt: steerBlocks },
-			commit: () => deliverSteers(turn.key, syncOf(turn), steerKeys),
+			commit: () => pendingSteers.deliver(turn.key, syncOf(turn), steerKeys),
 			steers: steerKeys,
 		});
 	}
@@ -1109,7 +872,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** Counts the agent's rejection of `prompt` against its steers; tells the user about the ones dropped. */
 	function rejectPrompt(turn: LiveTurn, prompt: TurnPrompt): void {
-		const dropped = rejectSteers(turn.key, prompt.steers);
+		const dropped = pendingSteers.reject(turn.key, prompt.steers);
 		if (dropped.length === 0) return;
 		const quoted = dropped.map((steer) => `"${summarize(plainText(steer.message), 80)}"`).join(", ");
 		turn.notice = `Pi dropped ${dropped.length} steering message(s) that ${turn.agent.name} rejected ${MAX_STEER_REJECTIONS} times: ${quoted}. Send again what still matters.`;
@@ -1246,7 +1009,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			ended = true;
 			turn.attached = null;
 			writer.toolUse(toolCall);
-			noteStreamed(turn, writer.message);
+			noteStreamed(syncOf(turn), writer.message);
 		};
 		const consume = (event: TurnEvent): void => {
 			if (ended) return;
@@ -1285,7 +1048,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				failTurn(writer, outcome.error, { aborted: turn.controller.signal.aborted, agent: turn.agent, auth: outcome.auth, notice: turn.notice });
 			else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
 			else finishTurn(writer, turn.agent, outcome.result.stopReason, turn.usage);
-			noteStreamed(turn, writer.message);
+			noteStreamed(syncOf(turn), writer.message);
 		};
 		while (turn.buffer.length > 0 && !ended) consume(turn.buffer.shift()!);
 		if (ended) return;
