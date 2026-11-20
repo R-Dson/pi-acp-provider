@@ -20,6 +20,8 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
 const optionalString = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
 
 /** `value` if it is one of `allowed`, else undefined. */
