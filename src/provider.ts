@@ -51,7 +51,6 @@ import {
 } from "@earendil-works/pi-ai";
 import { AcpClient, AcpRpcError, abortable, type PromptResult, type ServerRequest, type SessionInstance, type SessionSetup } from "./acp-client.ts";
 import {
-	ACP_AUTH_REQUIRED,
 	RPC_INVALID_PARAMS,
 	RPC_METHOD_NOT_FOUND,
 	autoApprove,
@@ -69,7 +68,7 @@ import {
 	type AcpSessionUpdate,
 } from "./acp.ts";
 import { PI_MCP_SERVER, deepMerge, type AcpAgentConfig, type AcpProviderConfig } from "./config.ts";
-import { addUsage, authHint, createMessageWriter, finishTurn, zeroUsage, type MessageWriter } from "./message-writer.ts";
+import { addUsage, createMessageWriter, failTurn, finishTurn, zeroUsage, type MessageWriter } from "./message-writer.ts";
 import { ACP_PROVIDER_ID, createModelCatalog, parseModelId } from "./models.ts";
 import { PiMcpServer, toMcpTool, type McpCall, type McpCallResult, type McpContent, type McpTool } from "./mcp-server.ts";
 import { ACP_TOOL_NAME, compactInput, type AcpToolArgs, type AcpToolState, type AwaitTool } from "./native-tools.ts";
@@ -799,9 +798,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const acp = getClient(agent);
 		const abortedOrError = (error: unknown): void => {
 			if (claims.get(key) === claim) claims.delete(key);
-			if (setupSignal.aborted) writer.fail("aborted", "Request was aborted");
-			else if (error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED) writer.fail("error", authHint(agent, acp.info));
-			else writer.fail("error", errorMessage(error));
+			failTurn(writer, error, { aborted: setupSignal.aborted, agent, auth: acp.info });
 		};
 
 		const systemPrompt = getCurrentSystemPrompt(context.messages);
@@ -1284,16 +1281,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			turn.attached = null;
 			if (lives.get(turn.key) === turn) lives.delete(turn.key);
 			if (claims.get(turn.key) === turn.controller) claims.delete(turn.key);
-			if ("error" in outcome) {
-				if (turn.controller.signal.aborted) writer.fail("aborted", "Request was aborted");
-				else {
-					const text =
-						outcome.error instanceof AcpRpcError && outcome.error.code === ACP_AUTH_REQUIRED
-							? authHint(turn.agent, outcome.auth)
-							: errorMessage(outcome.error);
-					writer.fail("error", turn.notice ? `${text}\n${turn.notice}` : text);
-				}
-			} else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
+			if ("error" in outcome)
+				failTurn(writer, outcome.error, { aborted: turn.controller.signal.aborted, agent: turn.agent, auth: outcome.auth, notice: turn.notice });
+			else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
 			else finishTurn(writer, turn.agent, outcome.result.stopReason, turn.usage);
 			noteStreamed(turn, writer.message);
 		};
@@ -1364,8 +1354,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				finishTurn(writer, agent, result.stopReason, usage);
 			}
 		} catch (error) {
-			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
-			else writer.fail("error", errorMessage(error));
+			failTurn(writer, error, { aborted: signal?.aborted ?? false, agent });
 		} finally {
 			client.dispose();
 		}

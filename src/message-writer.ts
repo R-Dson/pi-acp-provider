@@ -1,5 +1,6 @@
 import type { AssistantMessage, AssistantMessageEventStream, ToolCall, Usage } from "@earendil-works/pi-ai";
-import type { AcpAgentInfo, AcpStopReason, AcpUsage } from "./acp.ts";
+import { AcpRpcError } from "./acp-client.ts";
+import { ACP_AUTH_REQUIRED, errorMessage, type AcpAgentInfo, type AcpStopReason, type AcpUsage } from "./acp.ts";
 import type { AcpAgentConfig } from "./config.ts";
 
 export const zeroUsage = (): Usage => ({
@@ -109,7 +110,7 @@ export function createMessageWriter(stream: AssistantMessageEventStream, message
 export type MessageWriter = ReturnType<typeof createMessageWriter>;
 
 /** Explains `auth_required`, listing the methods the agent advertised. */
-export function authHint(agent: AcpAgentConfig, info: AcpAgentInfo | null): string {
+function authHint(agent: AcpAgentConfig, info: AcpAgentInfo | null): string {
 	const methods = info?.authMethods ?? [];
 	if (methods.length === 0) return `${agent.name} requires authentication. Sign in with the agent's own CLI, then retry.`;
 	const list = methods
@@ -118,6 +119,24 @@ export function authHint(agent: AcpAgentConfig, info: AcpAgentInfo | null): stri
 	return agent.authMethod
 		? `${agent.name} still requires authentication after trying method '${agent.authMethod}'. Available methods: ${list}.`
 		: `${agent.name} requires authentication. Sign in with the agent's own CLI, or set "authMethod" for this agent in ~/.pi/agent/settings.json to one of: ${list}.`;
+}
+
+export type FailTurnOptions = {
+	aborted: boolean;
+	agent: AcpAgentConfig;
+	/** WARN: omit it to report `auth_required` as a plain error; `null` still gives the hint, without methods. */
+	auth?: AcpAgentInfo | null;
+	notice?: string | undefined;
+};
+
+export function failTurn(writer: MessageWriter, error: unknown, { aborted, agent, auth, notice }: FailTurnOptions): void {
+	if (aborted) {
+		writer.fail("aborted", "Request was aborted");
+		return;
+	}
+	const text =
+		auth !== undefined && error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED ? authHint(agent, auth) : errorMessage(error);
+	writer.fail("error", notice ? `${text}\n${notice}` : text);
 }
 
 /** Ends the message according to the agent's `stopReason`. */
