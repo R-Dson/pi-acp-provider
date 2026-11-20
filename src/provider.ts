@@ -89,6 +89,8 @@ import {
 export const ACP_PROVIDER_ID = "acp";
 const ACP_API = "acp";
 
+/** Until the agent reports its window in `usage_update.size`. */
+const DEFAULT_CONTEXT_WINDOW = 128_000;
 /** Rejections after which a steer is dropped rather than sent again. */
 const MAX_STEER_REJECTIONS = 2;
 const PI_THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -127,7 +129,7 @@ function toModel(agentId: string, id: string, name: string, thinking: ThinkingLe
 		...(thinking ? { thinkingLevelMap: thinking } : {}),
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128_000,
+		contextWindow: DEFAULT_CONTEXT_WINDOW,
 		maxTokens: 16_384,
 	};
 }
@@ -162,13 +164,34 @@ const zeroUsage = (): Usage => ({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 });
 
-function addUsage(total: Usage, usage: AcpUsage | undefined): void {
-	if (!usage) return;
-	total.input += usage.input;
-	total.output += usage.output;
-	total.cacheRead += usage.cacheRead;
-	total.cacheWrite += usage.cacheWrite;
-	total.totalTokens = total.input + total.output + total.cacheRead + total.cacheWrite;
+/**
+ * WARN: an ACP prompt result sums the usage of every model call in the turn, and each call re-reads the
+ * whole context, so the sum overstates the context many times. Pi reads `totalTokens` as the context
+ * size, so it takes the agent's `usage_update.used` instead when the agent sent one.
+ * WARN: pi-ai's `isContextOverflow` also reads `input + cacheRead` of a finished message as its prompt
+ * size and auto-compacts when that exceeds the window, so the summed prompt-side counts must not
+ * outgrow `contextUsed` either; a long tool loop otherwise looks like an overflow every turn.
+ */
+function addUsage(total: Usage, usage: AcpUsage | undefined, contextUsed?: number): void {
+	if (usage) {
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+	}
+	if (contextUsed === undefined) {
+		total.totalTokens = total.input + total.output + total.cacheRead + total.cacheWrite;
+		return;
+	}
+	total.totalTokens = contextUsed;
+	const prompt = total.input + total.cacheRead + total.cacheWrite;
+	if (prompt <= contextUsed) return;
+	// WHY: scaling keeps the agent's input/cache split (its cache hit ratio) while making the parts add up
+	// to the real context; ACP reports no per-call breakdown to pick the last call's numbers from instead.
+	const scale = contextUsed / prompt;
+	total.input = Math.floor(total.input * scale);
+	total.cacheWrite = Math.floor(total.cacheWrite * scale);
+	total.cacheRead = contextUsed - total.input - total.cacheWrite;
 }
 
 /** Decides a `session/request_permission`; `signal` aborts when the turn is cancelled. */
@@ -417,6 +440,7 @@ interface LiveTurn {
 	/** `turnKey(agent id, Pi's StreamOptions.sessionId or "")`: the turn's slot in `lives`, `claims`, `served` and `pendingSteers`. */
 	key: string;
 	agent: AcpAgentConfig;
+	modelId: string;
 	acp: AcpClient;
 	sessionId: string;
 	/** The session instance the turn set up; its prompts are refused once that one ended. */
@@ -454,6 +478,8 @@ interface LiveTurn {
 	/** Every Pi tool call this turn handed to Pi: Pi answers each, even once its MCP request is gone. */
 	issued: Set<string>;
 	usage: Usage;
+	/** The agent's latest `usage_update.used`: what its context holds now. */
+	contextUsed: number | undefined;
 	onRawUpdate: ((params: unknown) => void) | undefined;
 	/** Told to the user when the turn ends in an error, after the error itself. */
 	notice: string | undefined;
@@ -578,8 +604,18 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const agents = new Map(options.config.agents.map((agent) => [agent.id, agent]));
 	/** Each agent's models from discovery (or the persisted catalog); default model only until then. */
 	const discovered = new Map<string, Model<Api>[]>();
+	/** The context window each model's agent last reported in `usage_update.size`, by Pi model id. */
+	const reportedWindows = new Map<string, number>();
+	// WARN: Pi reads `contextWindow` from the selected model and replaces that only on model selection or
+	// provider registration, so a reported size takes effect when the catalogue is next published, not mid-session.
+	// A models.json `modelOverrides` entry still wins: Pi applies it on top of these models.
 	const buildModels = () =>
-		options.config.agents.flatMap((agent) => discovered.get(agent.id) ?? agentModels(agent));
+		options.config.agents.flatMap((agent) =>
+			(discovered.get(agent.id) ?? agentModels(agent)).map((model) => {
+				const reported = reportedWindows.get(model.id);
+				return reported === undefined || reported === model.contextWindow ? model : { ...model, contextWindow: reported };
+			}),
+		);
 	let models = buildModels();
 	let cwd = process.cwd();
 	/** One client (and agent process) per agent, spawned on first use. */
@@ -1101,6 +1137,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const turn: LiveTurn = {
 			key,
 			agent,
+			modelId: model.id,
 			acp,
 			sessionId,
 			instance,
@@ -1119,6 +1156,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			piCalls: new Map(),
 			issued: new Set(),
 			usage: zeroUsage(),
+			contextUsed: undefined,
 			onRawUpdate,
 			notice: undefined,
 		};
@@ -1283,6 +1321,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** Records an update, then hands it to the attached message or buffers it for the next one. */
 	function dispatch(turn: LiveTurn, event: TurnEvent): void {
+		if (event.type === "usage_update") {
+			turn.contextUsed = event.used;
+			if (event.size !== undefined) reportedWindows.set(turn.modelId, event.size);
+			return;
+		}
 		if (event.type === "tool_call" || event.type === "tool_call_update") {
 			let entry = turn.tools.get(event.toolCallId);
 			if (!entry) {
@@ -1412,7 +1455,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			else if (event.type === "pi_tool_call") {
 				if (!turn.piCalls.has(event.id)) return;
 				endAt({ type: "toolCall", id: event.id, name: event.name, arguments: event.arguments as ToolCall["arguments"] });
-			} else {
+			} else if (event.type === "tool_call" || event.type === "tool_call_update") {
 				const entry = turn.tools.get(event.toolCallId);
 				if (!entry || entry.piOwned) return;
 				if (!turn.native) {
@@ -1462,7 +1505,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	function settleTurn(turn: LiveTurn, outcome: TurnOutcome): void {
 		turn.running = false;
-		if ("result" in outcome && outcome.result.kind === "finished") addUsage(turn.usage, outcome.result.usage);
+		if ("result" in outcome && outcome.result.kind === "finished") addUsage(turn.usage, outcome.result.usage, turn.contextUsed);
 		const next = turn.queued.shift();
 		const cleanEnd = "result" in outcome && outcome.result.kind === "finished" && outcome.result.stopReason === "end_turn";
 		if (next && cleanEnd && !turn.controller.signal.aborted) {
@@ -1508,18 +1551,23 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			if (others.length > 0) blocks.push(tagged("conversation-history", renderTranscript(messages), "The conversation:"));
 			else for (const user of users) blocks.push(...userBlocks(user, info.capabilities.image));
 			stream.push({ type: "start", partial: message });
+			let contextUsed: number | undefined;
 			const result = await client.prompt({
 				sessionId,
 				payload: { sessionId, prompt: blocks },
 				signal,
 				onUpdate: (update) => {
 					if (update.type === "agent_message_chunk") writer.append("text", update.text);
+					else if (update.type === "usage_update") {
+						contextUsed = update.used;
+						if (update.size !== undefined) reportedWindows.set(model.id, update.size);
+					}
 				},
 			});
 			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
 			else {
 				const usage = zeroUsage();
-				addUsage(usage, result.usage);
+				addUsage(usage, result.usage, contextUsed);
 				finishTurn(writer, agent, result.stopReason, usage);
 			}
 		} catch (error) {
@@ -1605,9 +1653,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const restored = new Map<string, Model<Api>[]>();
 		for (const model of context.stored?.models ?? []) {
 			const owner = parseModelId(model.id, agents)?.agent.id;
-			if (!owner || discovered.has(owner)) continue;
+			if (!owner) continue;
+			const stored: unknown = "contextWindow" in model ? model.contextWindow : undefined;
+			const window = typeof stored === "number" && Number.isSafeInteger(stored) && stored > 0 ? stored : DEFAULT_CONTEXT_WINDOW;
+			// WHY: the persisted catalogue holds only windows this provider published, so a non-default one was
+			// reported by the agent earlier and must survive the rediscovery below, which starts from the default.
+			if (window !== DEFAULT_CONTEXT_WINDOW && !reportedWindows.has(model.id)) reportedWindows.set(model.id, window);
+			if (discovered.has(owner)) continue;
 			const list = restored.get(owner) ?? [];
-			list.push(model as Model<Api>);
+			list.push({ ...(model as Model<Api>), contextWindow: window });
 			restored.set(owner, list);
 		}
 		for (const [owner, list] of restored) discovered.set(owner, list);

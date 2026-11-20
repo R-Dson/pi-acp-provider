@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -111,6 +112,108 @@ test("happy path: ordered events, balanced blocks, zero usage", async () => {
 	assert.match(text, /Hello world #\d+/);
 });
 
+test("context size comes from usage_update, not the turn's summed usage", async () => {
+	const handle = makeProvider();
+	const last = await lastEvent(handle, "USAGE please");
+	assert.ok(last?.type === "done");
+	const { usage } = last.message;
+	assert.equal(usage.totalTokens, 1234);
+	assert.equal(usage.output, 20);
+	assert.equal(usage.input + usage.cacheRead + usage.cacheWrite, 1234);
+});
+
+for (const [label, options] of [
+	["a live turn", {}],
+	["an isolated request", { cacheRetention: "none" }],
+] as const) {
+	test(`a long tool loop's summed usage is not a context overflow (${label})`, async () => {
+		const handle = makeProvider();
+		const model = firstModel(handle);
+		const events = await collect(handle.provider.streamSimple(model, userContext("LONGLOOP please"), options));
+		const last = events.at(-1);
+		assert.ok(last?.type === "done");
+		const { usage } = last.message;
+		assert.equal(usage.totalTokens, 100000);
+		assert.equal(usage.output, 9000);
+		assert.ok(usage.input + usage.cacheRead + usage.cacheWrite <= 100000);
+		assert.ok(usage.input + usage.cacheRead <= model.contextWindow);
+		assert.equal(isContextOverflow(last.message, model.contextWindow), false);
+	});
+}
+
+async function refreshOffline(handle: AcpProviderHandle, stored?: Model<Api>[]): Promise<Model<Api>[]> {
+	let published: Model<Api>[] = [];
+	await handle.provider.refreshModels?.({
+		allowNetwork: false,
+		signal: new AbortController().signal,
+		...(stored ? { stored: { models: stored, checkedAt: 0 } } : {}),
+		publish: async ({ persist, update }) => {
+			published = (persist?.models ?? []) as Model<Api>[];
+			update?.();
+			return true;
+		},
+	});
+	return published;
+}
+
+for (const [label, options] of [
+	["a live turn", {}],
+	["an isolated request", { cacheRetention: "none" }],
+] as const) {
+	test(`the refreshed catalogue takes the window the agent reported (${label})`, async () => {
+		const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+		const model = firstModel(handle);
+		assert.equal(model.contextWindow, 128_000);
+		const last = (await collect(handle.provider.streamSimple(model, userContext("USAGE please"), options))).at(-1);
+		assert.ok(last?.type === "done");
+		const published = await refreshOffline(handle);
+		assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 200_000], ["other", 128_000]]);
+		assert.deepEqual(handle.provider.getModels().map((entry) => entry.contextWindow), [200_000, 128_000]);
+	});
+}
+
+test("a window reported for one of the agent's models applies to that model only", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config" } })]);
+	await handle.provider.refreshModels?.({ allowNetwork: true, signal: new AbortController().signal, publish: async ({ update }) => (update?.(), true) });
+	const smart = handle.provider.getModels().find((entry) => entry.id === "fake/smart");
+	assert.ok(smart);
+	assert.ok((await lastEvent(handle, "USAGE please", smart))?.type === "done");
+	const published = await refreshOffline(handle);
+	assert.deepEqual(
+		published.map((entry) => [entry.id, entry.contextWindow]),
+		[["fake", 128_000], ["fake/fast", 128_000], ["fake/smart", 200_000]],
+	);
+});
+
+test("a persisted reported window survives rediscovery", async () => {
+	const handle = makeProvider();
+	const stored = handle.provider.getModels().map((entry) => ({ ...entry, contextWindow: 200_000 }));
+	await handle.provider.refreshModels?.({
+		allowNetwork: true,
+		signal: new AbortController().signal,
+		stored: { models: stored, checkedAt: 0 },
+		publish: async ({ update }) => (update?.(), true),
+	});
+	assert.equal(firstModel(handle).contextWindow, 200_000);
+});
+
+for (const size of ["1e999", "0", "-5", "12.5", '"200000"', "null"]) {
+	test(`a reported size of ${size} keeps the configured window`, async () => {
+		const handle = makeProvider([fakeAgent({ env: { FAKE_USAGE_SIZE: size } })]);
+		assert.ok((await lastEvent(handle, "USAGE please"))?.type === "done");
+		const published = await refreshOffline(handle);
+		assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 128_000]]);
+		assert.equal(JSON.parse(JSON.stringify(published))[0].contextWindow, 128_000);
+	});
+}
+
+test("a persisted window that is not a positive integer is not restored", async () => {
+	const handle = makeProvider();
+	const stored = handle.provider.getModels().map((entry) => ({ ...entry, contextWindow: null as unknown as number }));
+	const published = await refreshOffline(handle, stored);
+	assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 128_000]]);
+});
+
 async function isolatedSessionParams(agent: AcpAgentConfig) {
 	const handle = makeProvider([agent]);
 	const last = (await collect(handle.provider.streamSimple(firstModel(handle), userContext("SESSIONINFO"), { cacheRetention: "none" }))).at(-1);
@@ -138,6 +241,15 @@ test("an isolated request keeps the session params of an agent without a tools s
 	);
 	assert.deepEqual(params.mcpServers, []);
 	assert.equal(params._meta, undefined);
+});
+
+test("without usage_update the turn's summed usage is reported unchanged", async () => {
+	const handle = makeProvider();
+	const last = await lastEvent(handle, "LONGLOOP NOUPDATE please");
+	assert.ok(last?.type === "done");
+	const { usage } = last.message;
+	assert.deepEqual([usage.input, usage.output, usage.cacheRead, usage.cacheWrite], [2000, 9000, 4869752, 120000]);
+	assert.equal(usage.totalTokens, 5000752);
 });
 
 test("agents run as separate processes with separate sessions", async () => {
