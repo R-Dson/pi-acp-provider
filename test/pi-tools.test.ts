@@ -349,6 +349,14 @@ test("a Pi-named permission request on a session without Pi's MCP server goes to
 	assert.deepEqual(asked, ["mcp__pi__echo"]);
 });
 
+test("a Pi-named permission request from an isolated request is rejected without asking the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked);
+	const message = await step(handle, [user("PERMISSION summarize")], undefined, { cacheRetention: "none" });
+	assert.match(textOf(message), /\[approved=deny\]/);
+	assert.deepEqual(asked, []);
+});
+
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_MCP_TITLE: "Run something" } })], { nativeTools: () => true });
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
@@ -776,6 +784,17 @@ test("a pending steer a fork removed from Pi's branch is not sent", async () => 
 	const forked = await capture(handle, [...messages.slice(0, 2), user("ECHO other")]);
 	assert.equal(forked.message.stopReason, "stop");
 	assert.doesNotMatch(forked.prompt, /STEER-LATE|Delivered late/);
+});
+
+test("isolated requests run in a separate agent process", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })]);
+	const messages: Message[] = [user("ECHO main")];
+	const first = await step(handle, messages);
+	const summary = textOf(await step(handle, [user("ECHO summarize")], "SUMMARIZER", { cacheRetention: "none" }));
+	assert.match(summary, /SUMMARIZER[\s\S]*ECHO summarize/);
+	messages.push(first, user("ECHO again"));
+	const again = textOf(await step(handle, messages));
+	assert.match(again, /ECHO\[sess-1\]<<<ECHO again>>>/, "the main session is untouched");
 });
 
 const foreignReply = (text: string): Message =>

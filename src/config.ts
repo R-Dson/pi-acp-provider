@@ -103,13 +103,16 @@ export const AGENT_PRESETS: Readonly<Record<string, AgentPreset>> = {
 	// Claude Code runs on Pi's tools alone: `tools: []` removes its built-ins,
 	// `strictMcpConfig` ignores MCP servers from its own config, the cloud
 	// connector loader is switched off by env, and Pi's server is pre-approved.
+	// DISABLE_AUTO_COMPACT leaves compaction to Pi: when both sides compact, the
+	// prompt cache is flushed twice and the two thresholds race. It also stops
+	// claude-agent-acp's idle compaction before the 1-hour cache expires.
 	"claude-agent-acp": {
 		piTools: "pi",
 		mcpTransport: "http",
 		systemPrompt: "session",
 		sessionMeta: { claudeCode: { options: { allowedTools: [`mcp__${PI_MCP_SERVER}`] } } },
 		ownToolsOffMeta: { claudeCode: { options: { tools: [], strictMcpConfig: true } } },
-		env: { ENABLE_CLAUDEAI_MCP_SERVERS: "0" },
+		env: { ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
 	},
 	// Codex has no documented ACP switch for its built-in tools, so it keeps them.
 	"codex-acp": {

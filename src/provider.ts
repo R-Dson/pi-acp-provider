@@ -27,6 +27,8 @@
  *   when the agent supports it, else with the next Pi tool result it is
  *   waiting on, else as the next prompt once the running one ends. A steer
  *   that prompt never delivered goes with the next prompt Pi sends.
+ * - Isolated requests (compaction and branch summaries, `cacheRetention:
+ *   "none"`) run in a separate, throwaway agent process.
  */
 
 import { randomUUID } from "node:crypto";
@@ -57,6 +59,7 @@ import {
 	RPC_INVALID_PARAMS,
 	RPC_METHOD_NOT_FOUND,
 	autoApprove,
+	autoReject,
 	isRecord,
 	parsePermissionRequest,
 	structuredToolIdentities,
@@ -76,6 +79,7 @@ import { ACP_TOOL_NAME, compactInput, type AcpToolArgs, type AcpToolState, type 
 import {
 	conversation,
 	messageKey,
+	renderTranscript,
 	tagged,
 	transcriptOf,
 	userBlocks,
@@ -595,7 +599,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const nonceSessions = new Map<string, { agentId: string; sessionId: string; instance: SessionInstance | undefined }>();
 	/** The MCP nonce minted for each `session/new` params object, until the session is bound or fails. */
 	const mintedNonces = new WeakMap<Record<string, unknown>, string>();
-	/** The `SessionSetup.key` (Pi tool wiring) each session was opened with, by client and session id. */
+	/** The `SessionSetup.key` (Pi tool wiring) each main-client session was opened with, by client and session id. */
 	const sessionWiring = new WeakMap<AcpClient, Map<string, string>>();
 	const wiringOf = (client: AcpClient): Map<string, string> => {
 		let wiring = sessionWiring.get(client);
@@ -625,6 +629,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const answerServerRequest = async (
 		agent: AcpAgentConfig,
 		client: AcpClient,
+		isolated: boolean,
 		{ method, params, sessionId, signal }: ServerRequest,
 	): Promise<unknown> => {
 		if (method !== "session/request_permission") {
@@ -634,6 +639,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!request) throw new AcpRpcError("Malformed session/request_permission params", RPC_INVALID_PARAMS);
 		// A cancelled turn must answer every pending permission request with `cancelled`.
 		if (signal?.aborted) return { outcome: { outcome: "cancelled" } };
+		// WHY: a summary needs no tools and Pi shows none of an isolated session's calls, so nothing there is
+		// granted (fail closed); this is the only guard for agents without `ownToolsOffMeta` (Codex).
+		if (isolated) return { outcome: autoReject(request) };
 		// Pi's own tools pass Pi's approval when Pi runs them, so the agent's check is redundant.
 		if (isPiToolPermission(agent, client, sessionId, params)) return { outcome: autoApprove(request) };
 		const outcome = await policy(request, { agent, signal });
@@ -642,7 +650,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/**
 	 * Whether a permission request is for a call of Pi's own tool, judged by structure only: it
-	 * comes from the live turn's session, which holds a bound MCP nonce, and names a
+	 * comes from the main client on the live turn's session, which holds a bound MCP nonce, and names a
 	 * tool call the agent reported and has not reported finished; every structured identity of the request
 	 * and of the call's reports names one and the same tool Pi serves.
 	 * WARN: titles, `piOwned`, `mirrored` and `state` are display state an agent or a tool's input can steer;
@@ -677,7 +685,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		);
 	}
 
-	/** Forgets an ended session of `agent`'s client and revokes its MCP nonces. */
+	/** Forgets an ended session of `agent`'s main client and revokes its MCP nonces. */
 	function endSession(agent: AcpAgentConfig, client: AcpClient, sessionId: string): void {
 		sync.delete(turnKey(agent.id, sessionId));
 		wiringOf(client).delete(sessionId);
@@ -691,15 +699,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const newClient = (
 		agent: AcpAgentConfig,
 		clientCwd: string,
-		onSessionEnd: (client: AcpClient, sessionId: string) => void,
+		role: { isolated: true } | { onSessionEnd: (client: AcpClient, sessionId: string) => void },
 	): AcpClient => {
+		const isolated = "isolated" in role;
+		const onSessionEnd = "onSessionEnd" in role ? role.onSessionEnd : undefined;
 		const client: AcpClient = new AcpClient({
 			agent,
 			cwd: clientCwd,
 			handshakeTimeoutMs: options.config.handshakeTimeoutMs,
 			cancelGraceMs: options.cancelGraceMs,
-			onServerRequest: (request) => answerServerRequest(agent, client, request),
-			onSessionEnd: (sessionId) => onSessionEnd(client, sessionId),
+			onServerRequest: (request) => answerServerRequest(agent, client, isolated, request),
+			onSessionEnd: onSessionEnd && ((sessionId) => onSessionEnd(client, sessionId)),
 			log: log && ((message) => log(`${agent.id}: ${message}`)),
 		});
 		return client;
@@ -708,7 +718,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const getClient = (agent: AcpAgentConfig): AcpClient => {
 		let client = clients.get(agent.id);
 		if (!client) {
-			client = newClient(agent, cwd, (owner, sessionId) => endSession(agent, owner, sessionId));
+			// WARN: only the main client reports ended sessions: session ids are unique per process at
+			// best, so an isolated client's ended session could share an id with a live main one.
+			client = newClient(agent, cwd, { onSessionEnd: (owner, sessionId) => endSession(agent, owner, sessionId) });
 			clients.set(agent.id, client);
 		}
 		return client;
@@ -799,6 +811,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 	}
 
+	/**
+	 * `session/new` params for an isolated request: no Pi tools, and the agent's own tools off whenever it has
+	 * a switch for them, whatever `piTools` says, because a summary needs no tools (fail closed).
+	 * WARN: agents without `ownToolsOffMeta` (Codex) get the bare params isolated sessions always had, without
+	 * `sessionMeta`, and keep their built-in tools; ACP has no generic switch. Their permission requests are
+	 * still rejected in `answerServerRequest`, but a tool the agent runs without asking is not stopped.
+	 */
+	function isolatedSetup(agent: AcpAgentConfig): SessionSetup {
+		return {
+			key: "isolated",
+			params: () => (agent.ownToolsOffMeta ? { _meta: deepMerge(agent.sessionMeta ?? {}, agent.ownToolsOffMeta) } : {}),
+		};
+	}
+
 	/** Whether the session streamed `message` itself. */
 	function isOwnReply(state: SyncState, message: Message): boolean {
 		return message.role === "assistant" && message.provider === ACP_PROVIDER_ID && state.ownStamps.has(message.timestamp);
@@ -884,6 +910,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (extra?.disableContinuation === true && extra.maxTokens === 1) {
 			stream.push({ type: "start", partial: message });
 			writer.done("stop");
+			return;
+		}
+		if (streamOptions?.cacheRetention === "none") {
+			await runIsolated(stream, writer, message, agent, target.modelId, model, context, streamOptions);
 			return;
 		}
 		const conversationId = streamOptions?.sessionId ?? "";
@@ -1450,6 +1480,54 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			call.resolve({ content: [{ type: "text", text: "The turn ended before Pi ran this tool." }], isError: true });
 		}
 		turn.attached?.finish(outcome);
+	}
+
+	/** Runs a request outside the conversation (a summary) in a throwaway agent process. */
+	async function runIsolated(
+		stream: AssistantMessageEventStream,
+		writer: MessageWriter,
+		message: AssistantMessage,
+		agent: AcpAgentConfig,
+		modelId: string | undefined,
+		model: Model<Api>,
+		context: TranscriptContext,
+		streamOptions: StreamOptions,
+	): Promise<void> {
+		const signal = streamOptions.signal;
+		const client = newClient(agent, cwd, { isolated: true });
+		try {
+			const sessionId = await client.ensureSession({ signal, setup: isolatedSetup(agent) });
+			await applySettings(client, agent, sessionId, modelId, model, streamOptions);
+			const info = client.info ?? (await client.ensureReady(signal));
+			const blocks: AcpContentBlock[] = [];
+			const systemPrompt = getCurrentSystemPrompt(context.messages);
+			if (systemPrompt) blocks.push(tagged("system-instructions", systemPrompt, "Instructions for this request:"));
+			const messages = conversation(context.messages);
+			const users = messages.filter((candidate): candidate is UserMessage => candidate.role === "user");
+			const others = messages.filter((candidate) => candidate.role !== "user");
+			if (others.length > 0) blocks.push(tagged("conversation-history", renderTranscript(messages), "The conversation:"));
+			else for (const user of users) blocks.push(...userBlocks(user, info.capabilities.image));
+			stream.push({ type: "start", partial: message });
+			const result = await client.prompt({
+				sessionId,
+				payload: { sessionId, prompt: blocks },
+				signal,
+				onUpdate: (update) => {
+					if (update.type === "agent_message_chunk") writer.append("text", update.text);
+				},
+			});
+			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
+			else {
+				const usage = zeroUsage();
+				addUsage(usage, result.usage);
+				finishTurn(writer, agent, result.stopReason, usage);
+			}
+		} catch (error) {
+			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
+			else writer.fail("error", errorMessage(error));
+		} finally {
+			client.dispose();
+		}
 	}
 
 	const awaitTool: AwaitTool = (toolCallId, signal, onPartial) => {

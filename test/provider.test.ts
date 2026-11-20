@@ -11,7 +11,7 @@ import type {
 	Api,
 } from "@earendil-works/pi-ai";
 import { createAcpProvider, type AcpProviderOptions, type AcpProviderHandle } from "../src/provider.ts";
-import type { AcpAgentConfig } from "../src/config.ts";
+import { AGENT_PRESETS, type AcpAgentConfig } from "../src/config.ts";
 import { toToolResult, type AcpToolDetails } from "../src/native-tools.ts";
 
 const fakePath = fileURLToPath(new URL("./fake-agent.mjs", import.meta.url));
@@ -109,6 +109,35 @@ test("happy path: ordered events, balanced blocks, zero usage", async () => {
 	assert.match(text, /✓ grep for secrets: 3 matches\n/);
 	assert.doesNotMatch(text, /second line/, "tool output is summarized to its first line");
 	assert.match(text, /Hello world #\d+/);
+});
+
+async function isolatedSessionParams(agent: AcpAgentConfig) {
+	const handle = makeProvider([agent]);
+	const last = (await collect(handle.provider.streamSimple(firstModel(handle), userContext("SESSIONINFO"), { cacheRetention: "none" }))).at(-1);
+	assert.ok(last?.type === "done");
+	return JSON.parse(messageText(last.message)) as { mcpServers: unknown[]; _meta?: unknown };
+}
+
+test("an isolated request runs with the agent's own tools off when its preset can turn them off", async () => {
+	const claude = AGENT_PRESETS["claude-agent-acp"];
+	assert.ok(claude?.ownToolsOffMeta && claude.sessionMeta);
+	const params = await isolatedSessionParams(
+		fakeAgent({ piTools: "pi", sessionMeta: claude.sessionMeta, ownToolsOffMeta: claude.ownToolsOffMeta }),
+	);
+	assert.deepEqual(params.mcpServers, []);
+	assert.deepEqual(params._meta, {
+		claudeCode: { options: { allowedTools: ["mcp__pi"], tools: [], strictMcpConfig: true } },
+	});
+});
+
+test("an isolated request keeps the session params of an agent without a tools switch", async () => {
+	const codex = AGENT_PRESETS["codex-acp"];
+	assert.ok(codex && codex.ownToolsOffMeta === undefined);
+	const params = await isolatedSessionParams(
+		fakeAgent({ piTools: codex.piTools ?? "both", sessionMeta: { vendor: { option: true } }, ownToolsOffMeta: codex.ownToolsOffMeta }),
+	);
+	assert.deepEqual(params.mcpServers, []);
+	assert.equal(params._meta, undefined);
 });
 
 test("agents run as separate processes with separate sessions", async () => {
@@ -376,6 +405,33 @@ test("a rejecting permission policy reaches the agent", async () => {
 	assert.match(messageText(last.message), /\[approved=deny\]/);
 	assert.deepEqual(seen, ["fake:rm -rf build"]);
 });
+
+for (const [label, env, expected] of [
+	["rejected", {}, /\[approved=deny\]/],
+	["cancelled when it offers no reject option", { FAKE_PERMISSION_NO_REJECT: "1" }, /\[approved=cancelled\]/],
+] as const) {
+	test(`a permission request from an isolated request of an agent without a tools switch is ${label}, without the policy`, async () => {
+		const codex = AGENT_PRESETS["codex-acp"];
+		assert.ok(codex && codex.ownToolsOffMeta === undefined);
+		const seen: string[] = [];
+		const handle = makeProvider([fakeAgent({ piTools: codex.piTools ?? "both", ownToolsOffMeta: undefined, env })], {
+			permissionPolicy: async (request) => {
+				seen.push(request.title);
+				return { outcome: "selected", optionId: "allow" };
+			},
+		});
+		const last = (
+			await collect(handle.provider.streamSimple(firstModel(handle), userContext("PERMISSION summarize"), { cacheRetention: "none" }))
+		).at(-1);
+		assert.ok(last?.type === "done");
+		assert.match(messageText(last.message), expected);
+		assert.deepEqual(seen, []);
+		const live = await lastEvent(handle, "PERMISSION ask");
+		assert.ok(live?.type === "done");
+		assert.match(messageText(live.message), /\[approved=allow\]/, "live sessions still ask the policy");
+		assert.deepEqual(seen, ["rm -rf build"]);
+	});
+}
 
 test("aborting while a permission prompt is open answers it as cancelled", async () => {
 	const controller = new AbortController();

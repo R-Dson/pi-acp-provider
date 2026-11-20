@@ -80,11 +80,12 @@ test("claude and codex presets apply by command name, and settings override them
 	assert.equal(claude?.systemPrompt, "session");
 	assert.deepEqual(claude?.ownToolsOffMeta, { claudeCode: { options: { tools: [], strictMcpConfig: true } } });
 	assert.equal(claude?.env.ENABLE_CLAUDEAI_MCP_SERVERS, "0");
+	assert.equal(claude?.env.DISABLE_AUTO_COMPACT, "1");
 	assert.equal(codex?.piTools, "both");
 	assert.equal(codex?.mcpTransport, "http");
 	assert.equal(codex?.systemPrompt, "session");
 	assert.equal(custom?.piTools, "both");
-	assert.deepEqual(custom?.env, { ENABLE_CLAUDEAI_MCP_SERVERS: "0", EXTRA: "1" });
+	assert.deepEqual(custom?.env, { ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", EXTRA: "1" });
 	assert.deepEqual(custom?.sessionMeta, { claudeCode: { options: { allowedTools: ["mcp__pi"], model: "opus" } } });
 });
 
