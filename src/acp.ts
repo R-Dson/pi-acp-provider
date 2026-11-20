@@ -87,7 +87,32 @@ export type AcpSessionUpdate =
 			title: string | undefined;
 			status: ToolCallStatus | undefined;
 			summary: string;
+			/** ACP `ToolKind` (read, edit, execute, ...), when the agent sends one. */
+			kind: string | undefined;
+			/** Text output, file diffs and terminal ids of `content`; `undefined` when the update omits `content`. */
+			content: AcpToolContent | undefined;
+			locations: AcpToolLocation[] | undefined;
+			rawInput: unknown;
+			rawOutput: unknown;
 	  };
+
+export interface AcpToolDiff {
+	path: string;
+	/** `null` for a new file. */
+	oldText: string | null;
+	newText: string;
+}
+
+export interface AcpToolContent {
+	text: string[];
+	diffs: AcpToolDiff[];
+	terminals: string[];
+}
+
+export interface AcpToolLocation {
+	path: string;
+	line: number | undefined;
+}
 
 export interface AcpCommand {
 	name: string;
@@ -134,6 +159,32 @@ function toolContentSummary(content: unknown): string {
 	return parts.filter(Boolean).join("; ");
 }
 
+function parseToolContent(content: unknown): AcpToolContent | undefined {
+	if (!Array.isArray(content)) return undefined;
+	const parsed: AcpToolContent = { text: [], diffs: [], terminals: [] };
+	for (const item of content) {
+		if (!isRecord(item)) continue;
+		if (item.type === "content") {
+			const text = contentBlockText(item.content);
+			if (text) parsed.text.push(text);
+		} else if (item.type === "diff" && typeof item.path === "string" && typeof item.newText === "string") {
+			parsed.diffs.push({ path: item.path, oldText: typeof item.oldText === "string" ? item.oldText : null, newText: item.newText });
+		} else if (item.type === "terminal" && typeof item.terminalId === "string") {
+			parsed.terminals.push(item.terminalId);
+		}
+	}
+	return parsed;
+}
+
+function parseLocations(locations: unknown): AcpToolLocation[] | undefined {
+	if (!Array.isArray(locations)) return undefined;
+	return locations.flatMap((location): AcpToolLocation[] =>
+		isRecord(location) && typeof location.path === "string"
+			? [{ path: location.path, line: typeof location.line === "number" ? location.line : undefined }]
+			: [],
+	);
+}
+
 export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 	const update = updateOf(params);
 	switch (update?.sessionUpdate) {
@@ -149,6 +200,11 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 				title: optionalString(update.title),
 				status: oneOf(TOOL_CALL_STATUSES, update.status),
 				summary: toolContentSummary(update.content),
+				kind: optionalString(update.kind),
+				content: parseToolContent(update.content),
+				locations: parseLocations(update.locations),
+				rawInput: update.rawInput,
+				rawOutput: update.rawOutput,
 			};
 		default:
 			return null;
@@ -318,7 +374,10 @@ export function parseSessionConfig(result: unknown, previous: AcpSessionConfig =
 	const keptModel = !hasConfigOptions || previous.model?.configId === null ? previous.model : undefined;
 	return {
 		model: findSelect(result.configOptions, "model") ?? parseLegacyModels(result.models) ?? keptModel,
-		thoughtLevel: hasConfigOptions ? findSelect(result.configOptions, "thought_level") : previous.thoughtLevel,
+		// Mistral Vibe names the category "thinking" instead of the spec's "thought_level".
+		thoughtLevel: hasConfigOptions
+			? (findSelect(result.configOptions, "thought_level") ?? findSelect(result.configOptions, "thinking"))
+			: previous.thoughtLevel,
 	};
 }
 

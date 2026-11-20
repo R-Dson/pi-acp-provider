@@ -26,10 +26,11 @@ import {
 	type SimpleStreamOptions,
 	type StreamOptions,
 	type ThinkingLevelMap,
+	type ToolCall,
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { AcpClient, AcpRpcError, type ServerRequest } from "./acp-client.ts";
+import { AcpClient, AcpRpcError, type PromptResult, type ServerRequest } from "./acp-client.ts";
 import {
 	ACP_AUTH_REQUIRED,
 	RPC_INVALID_PARAMS,
@@ -46,6 +47,7 @@ import {
 	type AcpStopReason,
 } from "./acp.ts";
 import type { AcpAgentConfig, AcpProviderConfig } from "./config.ts";
+import { ACP_TOOL_NAME, compactInput, type AcpToolArgs, type AcpToolState, type AwaitTool } from "./native-tools.ts";
 
 export const ACP_PROVIDER_ID = "acp";
 const ACP_API = "acp";
@@ -123,6 +125,11 @@ export interface AcpProviderOptions {
 	/** Defaults to auto-approval. */
 	permissionPolicy?: PermissionPolicy;
 	log?: ((message: string) => void) | undefined;
+	/**
+	 * Whether to show agent tool calls as native Pi tool rows (see `native-tools.ts`). Checked when a
+	 * prompt starts; it needs the mirror tool to be active. Otherwise tool activity is inline text.
+	 */
+	nativeTools?: () => boolean;
 }
 
 export interface AcpProviderHandle {
@@ -133,6 +140,8 @@ export interface AcpProviderHandle {
 	agentFor(modelId: string): string | undefined;
 	/** Slash commands the agent's current session advertised; empty until it has started. */
 	commands(agentId: string): Promise<AcpCommand[]>;
+	/** Resolves a mirrored tool call once its agent reports a final status (the mirror tool's `execute`). */
+	awaitTool: AwaitTool;
 	/** Kills all agent processes; the provider respawns them if used again. */
 	dispose(): void;
 }
@@ -196,6 +205,17 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 		push();
 		stream.end(message);
 	};
+	/** Ends the message at a tool call Pi shows as a tool row; the ACP turn goes on in the next message. */
+	const toolUse = (toolCall: ToolCall): void =>
+		settle(() => {
+			close();
+			const contentIndex = message.content.length;
+			message.content.push(toolCall);
+			stream.push({ type: "toolcall_start", contentIndex, partial: message });
+			stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: message });
+			message.stopReason = "toolUse";
+			stream.push({ type: "done", reason: "toolUse", message });
+		});
 	const done = (reason: "stop" | "length"): void =>
 		settle(() => {
 			message.stopReason = reason;
@@ -208,10 +228,37 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 			stream.push({ type: "error", reason, error: message });
 		});
 
-	return { append, done, fail };
+	return { append, toolUse, done, fail };
 }
 
 type MessageWriter = ReturnType<typeof createMessageWriter>;
+
+type TurnOutcome = { result: PromptResult } | { error: unknown; auth: AcpAgentInfo | null };
+
+interface ToolWaiter {
+	resolve: (state: AcpToolState) => void;
+	onPartial: (state: AcpToolState) => void;
+}
+
+interface ToolEntry {
+	title: string | undefined;
+	/** The mirror tool's arguments, fixed by the first update so the tool row does not change. */
+	args: AcpToolArgs | undefined;
+	/** Whether a Pi message already shows this call as a tool row. */
+	mirrored: boolean;
+	state: AcpToolState;
+	waiters: Set<ToolWaiter>;
+}
+
+interface LiveTurn {
+	agent: AcpAgentConfig;
+	controller: AbortController;
+	/** Updates that arrived while no Pi message was attached (Pi was running the mirror tools). */
+	buffer: AcpSessionUpdate[];
+	attached: { consume: (update: AcpSessionUpdate) => void; finish: (outcome: TurnOutcome) => void } | null;
+	outcome: TurnOutcome | null;
+	tools: Map<string, ToolEntry>;
+}
 
 /** Renders tool activity as short inline notices in the reply text. */
 function createToolRenderer(append: (text: string) => void) {
@@ -329,6 +376,16 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 		const { agent } = target;
+		const lastMessage = context.messages.at(-1);
+		if (
+			live?.agent.id === agent.id &&
+			lastMessage?.role === "toolResult" &&
+			live.tools.get(lastMessage.toolCallId)?.mirrored
+		) {
+			stream.push({ type: "start", partial: message });
+			attach(live, writer, signal);
+			return;
+		}
 		const promptText = latestUserPrompt(context.messages);
 		if (promptText === null) {
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
@@ -352,22 +409,57 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 
 		stream.push({ type: "start", partial: message });
-		const renderTool = createToolRenderer((text) => writer.append("text", text));
 		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
+		const onRawUpdate =
+			onProviderStreamEvent &&
+			((params: unknown) => {
+				Promise.resolve(onProviderStreamEvent(params, model)).catch((error: unknown) =>
+					log?.(`onProviderStreamEvent failed: ${errorMessage(error)}`),
+				);
+			});
+		let payload: unknown;
 		try {
 			const defaultPayload = { sessionId, prompt: [{ type: "text", text: promptText }] };
-			const payload = (await streamOptions?.onPayload?.(defaultPayload, model)) ?? defaultPayload;
+			payload = (await streamOptions?.onPayload?.(defaultPayload, model)) ?? defaultPayload;
+		} catch (error) {
+			abortedOrError(error);
+			return;
+		}
+
+		if (options.nativeTools?.()) {
+			if (live) live.controller.abort();
+			const turn: LiveTurn = {
+				agent,
+				controller: new AbortController(),
+				buffer: [],
+				attached: null,
+				outcome: null,
+				tools: new Map(),
+			};
+			live = turn;
+			acp
+				.prompt({
+					sessionId,
+					payload,
+					signal: turn.controller.signal,
+					onRawUpdate,
+					onUpdate: (update) => dispatch(turn, update),
+				})
+				.then(
+					(result) => settleTurn(turn, { result }),
+					(error: unknown) => settleTurn(turn, { error, auth: acp.info }),
+				);
+			attach(turn, writer, signal);
+			return;
+		}
+
+		const renderTool = createToolRenderer((text) => writer.append("text", text));
+		try {
 			const result = await acp.prompt({
 				sessionId,
 				payload,
 				signal,
-				onRawUpdate:
-					onProviderStreamEvent &&
-					((params) => {
-						Promise.resolve(onProviderStreamEvent(params, model)).catch((error: unknown) =>
-							log?.(`onProviderStreamEvent failed: ${errorMessage(error)}`),
-						);
-					}),
+				onRawUpdate,
 				onUpdate: (update) => {
 					if (update.type === "agent_message_chunk") writer.append("text", update.text);
 					else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
@@ -380,6 +472,128 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			abortedOrError(error);
 		}
 	}
+
+	/** The ACP turn being shown with native tool rows; it spans several Pi messages. */
+	let live: LiveTurn | null = null;
+
+	/** Records an update, then hands it to the attached message or buffers it for the next one. */
+	function dispatch(turn: LiveTurn, update: AcpSessionUpdate): void {
+		if (update.type === "tool_call" || update.type === "tool_call_update") {
+			let entry = turn.tools.get(update.toolCallId);
+			if (!entry) {
+				entry = {
+					title: undefined,
+					args: undefined,
+					mirrored: false,
+					state: { status: undefined, content: { text: [], diffs: [], terminals: [] }, rawOutput: undefined },
+					waiters: new Set(),
+				};
+				turn.tools.set(update.toolCallId, entry);
+			}
+			if (update.title) entry.title = update.title;
+			if (update.status) entry.state.status = update.status;
+			if (update.content) entry.state.content = update.content;
+			if (update.rawOutput !== undefined) entry.state.rawOutput = update.rawOutput;
+			entry.args ??= {
+				agent: turn.agent.id,
+				title: entry.title ?? "tool",
+				...(update.kind ? { kind: update.kind } : {}),
+				...(update.locations?.length ? { locations: update.locations } : {}),
+				...(compactInput(update.rawInput) !== undefined ? { input: compactInput(update.rawInput) } : {}),
+			};
+			if (entry.mirrored) notifyWaiters(entry);
+		}
+		if (turn.attached) turn.attached.consume(update);
+		else turn.buffer.push(update);
+	}
+
+	function notifyWaiters(entry: ToolEntry, force = false): void {
+		const final = force || entry.state.status === "completed" || entry.state.status === "failed";
+		for (const waiter of [...entry.waiters]) {
+			if (final) {
+				entry.waiters.delete(waiter);
+				waiter.resolve(entry.state);
+			} else waiter.onPartial(entry.state);
+		}
+	}
+
+	/** Streams the turn into one Pi message until the next new tool call or the end of the turn. */
+	function attach(turn: LiveTurn, writer: MessageWriter, signal: AbortSignal | undefined): void {
+		if (signal?.aborted) turn.controller.abort();
+		else signal?.addEventListener("abort", () => turn.controller.abort(), { once: true });
+		let ended = false;
+		const consume = (update: AcpSessionUpdate): void => {
+			if (ended) return;
+			if (update.type === "agent_message_chunk") writer.append("text", update.text);
+			else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
+			else {
+				const entry = turn.tools.get(update.toolCallId);
+				if (!entry || entry.mirrored) return;
+				entry.mirrored = true;
+				ended = true;
+				turn.attached = null;
+				writer.toolUse({
+					type: "toolCall",
+					id: update.toolCallId,
+					name: ACP_TOOL_NAME,
+					arguments: (entry.args ?? { agent: turn.agent.id, title: entry.title ?? "tool" }) as unknown as ToolCall["arguments"],
+				});
+			}
+		};
+		const finish = (outcome: TurnOutcome): void => {
+			if (ended) return;
+			ended = true;
+			turn.attached = null;
+			if (live === turn) live = null;
+			if ("error" in outcome) {
+				if (turn.controller.signal.aborted) writer.fail("aborted", "Request was aborted");
+				else if (outcome.error instanceof AcpRpcError && outcome.error.code === ACP_AUTH_REQUIRED)
+					writer.fail("error", authHint(turn.agent, outcome.auth));
+				else writer.fail("error", errorMessage(outcome.error));
+			} else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
+			else finishTurn(writer, turn.agent, outcome.result.stopReason);
+		};
+		while (turn.buffer.length > 0 && !ended) consume(turn.buffer.shift()!);
+		if (ended) return;
+		if (turn.outcome) {
+			finish(turn.outcome);
+			return;
+		}
+		turn.attached = { consume, finish };
+	}
+
+	function settleTurn(turn: LiveTurn, outcome: TurnOutcome): void {
+		turn.outcome = outcome;
+		// Mirrored calls the agent never finalized end with what it last reported.
+		for (const entry of turn.tools.values()) notifyWaiters(entry, true);
+		turn.attached?.finish(outcome);
+	}
+
+	const awaitTool: AwaitTool = (toolCallId, signal, onPartial) => {
+		const turn = live;
+		const entry = turn?.tools.get(toolCallId);
+		if (!turn || !entry) {
+			return Promise.resolve({ status: "failed", content: { text: ["This ACP turn is no longer running."], diffs: [], terminals: [] }, rawOutput: undefined });
+		}
+		if (turn.outcome || entry.state.status === "completed" || entry.state.status === "failed") return Promise.resolve(entry.state);
+		return new Promise((resolve, reject) => {
+			const waiter: ToolWaiter = {
+				resolve: (state) => {
+					signal?.removeEventListener("abort", onAbort);
+					resolve(state);
+				},
+				onPartial,
+			};
+			const onAbort = (): void => {
+				entry.waiters.delete(waiter);
+				turn.controller.abort();
+				reject(new Error("Request was aborted"));
+			};
+			if (signal?.aborted) return onAbort();
+			signal?.addEventListener("abort", onAbort, { once: true });
+			entry.waiters.add(waiter);
+		});
+	};
 
 	/** Switches the session to the chosen model and Pi's thinking level, when the agent supports them. */
 	async function applySettings(
@@ -482,8 +696,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			for (const client of clients.values()) client.resetSession(nextCwd);
 		},
 		agentFor: (modelId) => parseModelId(modelId, agents)?.agent.id,
+		awaitTool,
 		commands: async (agentId) => (await clients.get(agentId)?.currentCommands()) ?? [],
 		dispose(): void {
+			live?.controller.abort();
+			live = null;
 			for (const client of clients.values()) client.dispose();
 			clients.clear();
 		},

@@ -8,6 +8,7 @@ test("defaults apply when nothing is configured", () => {
 		autoApproveTools: true,
 		handshakeTimeoutMs: 30_000,
 		debug: false,
+		nativeTools: true,
 	});
 });
 

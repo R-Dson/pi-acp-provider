@@ -12,6 +12,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { createAcpProvider, type AcpProviderOptions, type AcpProviderHandle } from "../src/provider.ts";
 import type { AcpAgentConfig } from "../src/config.ts";
+import { toToolResult, type AcpToolDetails } from "../src/native-tools.ts";
 
 const fakePath = fileURLToPath(new URL("./fake-agent.mjs", import.meta.url));
 
@@ -36,7 +37,7 @@ function makeProvider(
 	agents: AcpAgentConfig[] = [fakeAgent()],
 	extra: Omit<AcpProviderOptions, "config"> = {},
 ): AcpProviderHandle {
-	const handle = createAcpProvider({ config: { agents, autoApproveTools: true, handshakeTimeoutMs: 8000, debug: false }, ...extra });
+	const handle = createAcpProvider({ config: { agents, autoApproveTools: true, handshakeTimeoutMs: 8000, debug: false, nativeTools: false }, ...extra });
 	handles.push(handle);
 	return handle;
 }
@@ -329,6 +330,18 @@ test("picking a discovered model and thinking level switches the session", async
 	assert.match(messageText(back.message), /\[model=fast thought=none\]/);
 });
 
+test("a reasoning option in the \"thinking\" category (Mistral Vibe) gives thinking levels", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config", FAKE_THOUGHT_CATEGORY: "thinking" } })]);
+	await handle.provider.refreshModels?.(storeContext().context);
+	const smart = handle.provider.getModels().find((model) => model.id === "fake/smart");
+	assert.ok(smart?.reasoning);
+	assert.equal(smart.thinkingLevelMap?.high, "high");
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }];
+	const done = (await collect(handle.provider.streamSimple(smart, normalizeContext({ messages }), { reasoning: "high" }))).at(-1);
+	assert.ok(done?.type === "done");
+	assert.match(messageText(done.message), /\[model=smart thought=high\]/);
+});
+
 test("each agent's bare model keeps its own session default, even when session ids collide", async () => {
 	const handle = makeProvider([
 		fakeAgent({ env: { FAKE_MODELS: "config", FAKE_DEFAULT_MODEL: "smart" } }),
@@ -392,4 +405,93 @@ test("an agent slash command sent as the prompt returns the agent's output", asy
 	assert.ok(last?.type === "done");
 	assert.equal(messageText(last.message), "context: 42%");
 	assert.deepEqual((await handle.commands("fake")).map((command) => command.name), ["context", "session"]);
+});
+
+/** Plays Pi's agent loop: answers each mirrored tool call and calls the provider again until the turn ends. */
+async function nativeTurn(handle: AcpProviderHandle, text: string) {
+	const model = firstModel(handle);
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }];
+	const finals: AssistantMessageEvent[] = [];
+	const results: { args: unknown; details: AcpToolDetails; isError: boolean }[] = [];
+	for (let step = 0; step < 10; step++) {
+		const last = (await collect(handle.provider.streamSimple(model, normalizeContext({ messages }), {}))).at(-1);
+		assert.ok(last);
+		finals.push(last);
+		if (last.type !== "done" || last.reason !== "toolUse") return { finals, results };
+		messages.push(last.message);
+		for (const block of last.message.content) {
+			if (block.type !== "toolCall") continue;
+			const result = toToolResult(await handle.awaitTool(block.id, undefined, () => {}));
+			results.push({ args: block.arguments, details: result.details, isError: result.isError === true });
+			messages.push({
+				role: "toolResult",
+				toolCallId: block.id,
+				toolName: block.name,
+				content: result.content,
+				details: result.details,
+				isError: result.isError === true,
+				timestamp: Date.now(),
+			} as Message);
+		}
+	}
+	assert.fail("the turn did not end");
+}
+
+test("native tools: a tool call ends the message and the turn continues after its result", async () => {
+	const handle = makeProvider(undefined, { nativeTools: () => true });
+	const { finals, results } = await nativeTurn(handle, "hello");
+	assert.deepEqual(
+		finals.map((event) => (event.type === "done" ? event.reason : event.type)),
+		["toolUse", "stop"],
+	);
+	const first = finals[0];
+	assert.ok(first?.type === "done");
+	assert.ok(first.message.content.some((block) => block.type === "thinking"));
+	const call = first.message.content.at(-1);
+	assert.ok(call?.type === "toolCall");
+	assert.equal(call.name, "acp_tool");
+	assert.deepEqual(call.arguments, { agent: "fake", title: "grep for secrets", kind: "search" });
+	assert.equal(results[0]?.details.status, "completed");
+	assert.equal(results[0]?.details.output, "3 matches\nsecond line");
+	const last = finals[1];
+	assert.ok(last?.type === "done");
+	assert.doesNotMatch(messageText(last.message), /Executing/);
+	assert.match(messageText(last.message), /^Hello world #\d+$/);
+});
+
+test("native tools: each new tool call gets its own message", async () => {
+	const handle = makeProvider(undefined, { nativeTools: () => true });
+	const { finals, results } = await nativeTurn(handle, "ONESHOT go");
+	assert.deepEqual(
+		finals.map((event) => (event.type === "done" ? event.reason : event.type)),
+		["toolUse", "toolUse", "stop"],
+	);
+	assert.deepEqual(
+		results.map((result) => (result.args as { title: string }).title),
+		["read notes", "grep for secrets"],
+	);
+});
+
+test("native tools: an edit returns a display diff", async () => {
+	const handle = makeProvider(undefined, { nativeTools: () => true });
+	const { results } = await nativeTurn(handle, "DIFF go");
+	const edit = results[0];
+	assert.ok(edit);
+	assert.deepEqual((edit.args as { locations: unknown }).locations, [{ path: "/tmp/notes.txt", line: 2 }]);
+	assert.equal(edit.details.diffs[0]?.path, "/tmp/notes.txt");
+	assert.match(edit.details.diffs[0]?.diff ?? "", /-.*two/);
+	assert.match(edit.details.diffs[0]?.diff ?? "", /\+.*TWO/);
+});
+
+test("native tools: aborting while Pi waits on a mirrored call aborts the turn", async () => {
+	const handle = makeProvider(undefined, { nativeTools: () => true });
+	const model = firstModel(handle);
+	const first = (await collect(handle.provider.streamSimple(model, userContext("SLOW go"), {}))).at(-1);
+	assert.ok(first?.type === "done" && first.reason === "toolUse");
+	const call = first.message.content.at(-1);
+	assert.ok(call?.type === "toolCall");
+	const controller = new AbortController();
+	const waiting = handle.awaitTool(call.id, controller.signal, () => {});
+	controller.abort();
+	await assert.rejects(waiting, /aborted/);
 });
