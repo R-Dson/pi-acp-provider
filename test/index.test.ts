@@ -21,7 +21,10 @@ function makeFakePi() {
 	const commands = new Map<string, FakeCommand>();
 	const sent: string[] = [];
 	const models: unknown[] = [];
+	const tools: { name: string; prepareLoadout?: (loadout: unknown) => { hiddenDeclarations?: readonly string[] } | undefined }[] = [];
 	const pi = {
+		registerTool: (tool: (typeof tools)[number]) => tools.push(tool),
+		getActiveTools: () => tools.map((tool) => tool.name),
 		registerProvider: (provider: unknown) => providers.push(provider),
 		registerCommand: (name: string, options: FakeCommand) => commands.set(name, options),
 		sendUserMessage: (text: string) => sent.push(text),
@@ -31,7 +34,7 @@ function makeFakePi() {
 			return () => {};
 		},
 	};
-	return { pi: pi as unknown as ExtensionAPI, providers, handlers, commands, sent, models };
+	return { pi: pi as unknown as ExtensionAPI, providers, handlers, commands, sent, models, tools };
 }
 
 /** Runs `fn` with Pi's agent dir pointing at a temp dir holding the given settings.json. */
@@ -121,3 +124,21 @@ test("each agent gets a command that completes and runs its advertised slash com
 			handlers.get("session_shutdown")?.({}, {});
 		},
 	));
+
+test("the mirror tool is registered and hides its own declaration", () =>
+	withSettings({ acp: { agents: { fake: { command: "fake" } } } }, () => {
+		const { pi, tools } = makeFakePi();
+		acpExtension(pi);
+		assert.deepEqual(
+			tools.map((tool) => tool.name),
+			["acp_tool"],
+		);
+		assert.deepEqual(tools[0]?.prepareLoadout?.({})?.hiddenDeclarations, ["acp_tool"]);
+	}));
+
+test("nativeTools: false keeps inline tool notices and registers no tool", () =>
+	withSettings({ acp: { nativeTools: false, agents: { fake: { command: "fake" } } } }, () => {
+		const { pi, tools } = makeFakePi();
+		acpExtension(pi);
+		assert.equal(tools.length, 0);
+	}));
