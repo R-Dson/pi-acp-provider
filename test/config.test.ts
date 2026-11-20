@@ -8,6 +8,7 @@ test("defaults apply when nothing is configured", () => {
 		autoApproveTools: true,
 		handshakeTimeoutMs: 30_000,
 		debug: false,
+		nativeTools: true,
 	});
 });
 
@@ -21,9 +22,10 @@ test("agents resolve with defaults for optional fields", () => {
 		}),
 		env: {},
 	});
+	const baseline = { piTools: "both", mcpTransport: "stdio", systemPrompt: "prompt", sessionMeta: undefined, ownToolsOffMeta: undefined };
 	assert.deepEqual(config.agents, [
-		{ id: "copilot", name: "copilot", command: "copilot", args: ["--acp"], env: {}, authMethod: undefined },
-		{ id: "gemini", name: "Gemini", command: "gemini", args: [], env: { DEBUG: "0" }, authMethod: "oauth-personal" },
+		{ id: "copilot", name: "copilot", command: "copilot", args: ["--acp"], env: {}, authMethod: undefined, ...baseline },
+		{ id: "gemini", name: "Gemini", command: "gemini", args: [], env: { DEBUG: "0" }, authMethod: "oauth-personal", ...baseline },
 	]);
 });
 
@@ -42,4 +44,53 @@ test("invalid settings values and agents are dropped", () => {
 		}),
 		{ agents: { bad: { command: "a" } } },
 	);
+});
+
+test("agents without a preset get the baseline every ACP agent supports", () => {
+	const [vibe, agy] = resolveConfig({
+		settings: parseSettings({ agents: { vibe: { command: "vibe-acp" }, agy: { command: "agy", args: ["acp"] } } }),
+		env: {},
+	}).agents;
+	for (const agent of [vibe, agy]) {
+		assert.equal(agent?.piTools, "both");
+		assert.equal(agent?.mcpTransport, "stdio");
+		assert.equal(agent?.systemPrompt, "prompt");
+		assert.equal(agent?.sessionMeta, undefined);
+	}
+});
+
+test("claude and codex presets apply by command name, and settings override them", () => {
+	const [claude, codex, custom] = resolveConfig({
+		settings: parseSettings({
+			agents: {
+				claude: { command: "/usr/local/bin/claude-agent-acp" },
+				codex: { command: "codex-acp" },
+				custom: {
+					command: "claude-agent-acp",
+					piTools: "both",
+					env: { EXTRA: "1" },
+					sessionMeta: { claudeCode: { options: { model: "opus" } } },
+				},
+			},
+		}),
+		env: {},
+	}).agents;
+	assert.equal(claude?.piTools, "pi");
+	assert.equal(claude?.mcpTransport, "http");
+	assert.equal(claude?.systemPrompt, "session");
+	assert.deepEqual(claude?.ownToolsOffMeta, { claudeCode: { options: { tools: [], strictMcpConfig: true } } });
+	assert.equal(claude?.env.ENABLE_CLAUDEAI_MCP_SERVERS, "0");
+	assert.equal(claude?.env.DISABLE_AUTO_COMPACT, "1");
+	assert.equal(codex?.piTools, "both");
+	assert.equal(codex?.mcpTransport, "http");
+	assert.equal(codex?.systemPrompt, "session");
+	assert.equal(custom?.piTools, "both");
+	assert.deepEqual(custom?.env, { ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", EXTRA: "1" });
+	assert.deepEqual(custom?.sessionMeta, { claudeCode: { options: { allowedTools: ["mcp__pi"], model: "opus" } } });
+});
+
+test("invalid wiring values are dropped", () => {
+	assert.deepEqual(parseSettings({ agents: { a: { command: "a", piTools: "all", mcpTransport: "sse", systemPrompt: true } } }), {
+		agents: { a: { command: "a" } },
+	});
 });

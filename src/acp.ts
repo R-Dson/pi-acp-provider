@@ -85,9 +85,44 @@ export type AcpSessionUpdate =
 			type: "tool_call" | "tool_call_update";
 			toolCallId: string;
 			title: string | undefined;
+			/** The agent's internal tool name, when it sends one (`name`, or Claude's `_meta.claudeCode.toolName`). */
+			toolName: string | undefined;
+			/** Every structured identity the update carries, for authorization (see `structuredToolIdentities`). */
+			toolIdentities: unknown[];
 			status: ToolCallStatus | undefined;
 			summary: string;
+			/** ACP `ToolKind` (read, edit, execute, ...), when the agent sends one. */
+			kind: string | undefined;
+			/** Text output, file diffs and terminal ids of `content`; `undefined` when the update omits `content`. */
+			content: AcpToolContent | undefined;
+			locations: AcpToolLocation[] | undefined;
+			rawInput: unknown;
+			rawOutput: unknown;
+	  }
+	| {
+			/** `usage_update`: tokens the session's context holds now, and its window when known. */
+			type: "usage_update";
+			used: number;
+			size: number | undefined;
 	  };
+
+export interface AcpToolDiff {
+	path: string;
+	/** `null` for a new file. */
+	oldText: string | null;
+	newText: string;
+}
+
+export interface AcpToolContent {
+	text: string[];
+	diffs: AcpToolDiff[];
+	terminals: string[];
+}
+
+export interface AcpToolLocation {
+	path: string;
+	line: number | undefined;
+}
 
 export interface AcpCommand {
 	name: string;
@@ -134,6 +169,46 @@ function toolContentSummary(content: unknown): string {
 	return parts.filter(Boolean).join("; ");
 }
 
+function parseToolContent(content: unknown): AcpToolContent | undefined {
+	if (!Array.isArray(content)) return undefined;
+	const parsed: AcpToolContent = { text: [], diffs: [], terminals: [] };
+	for (const item of content) {
+		if (!isRecord(item)) continue;
+		if (item.type === "content") {
+			const text = contentBlockText(item.content);
+			if (text) parsed.text.push(text);
+		} else if (item.type === "diff" && typeof item.path === "string" && typeof item.newText === "string") {
+			parsed.diffs.push({ path: item.path, oldText: typeof item.oldText === "string" ? item.oldText : null, newText: item.newText });
+		} else if (item.type === "terminal" && typeof item.terminalId === "string") {
+			parsed.terminals.push(item.terminalId);
+		}
+	}
+	return parsed;
+}
+
+function parseLocations(locations: unknown): AcpToolLocation[] | undefined {
+	if (!Array.isArray(locations)) return undefined;
+	return locations.flatMap((location): AcpToolLocation[] =>
+		isRecord(location) && typeof location.path === "string"
+			? [{ path: location.path, line: typeof location.line === "number" ? location.line : undefined }]
+			: [],
+	);
+}
+
+function claudeToolName(meta: unknown): string | undefined {
+	return isRecord(meta) && isRecord(meta.claudeCode) ? optionalString(meta.claudeCode.toolName) : undefined;
+}
+
+/**
+ * Every structured tool identity a tool call record carries, whatever its type: ACP `name` and Claude's
+ * `_meta.claudeCode.toolName`, in that order, each when present.
+ * WARN: authorization must check all of them; picking one lets a conflicting other field go unseen.
+ */
+export function structuredToolIdentities(record: Record<string, unknown>): unknown[] {
+	const meta = isRecord(record._meta) && isRecord(record._meta.claudeCode) ? record._meta.claudeCode : undefined;
+	return [record.name, meta?.toolName].filter((identity) => identity !== undefined);
+}
+
 export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 	const update = updateOf(params);
 	switch (update?.sessionUpdate) {
@@ -147,8 +222,22 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 				type: update.sessionUpdate,
 				toolCallId: update.toolCallId,
 				title: optionalString(update.title),
+				toolName: optionalString(update.name) ?? claudeToolName(update._meta),
+				toolIdentities: structuredToolIdentities(update),
 				status: oneOf(TOOL_CALL_STATUSES, update.status),
 				summary: toolContentSummary(update.content),
+				kind: optionalString(update.kind),
+				content: parseToolContent(update.content),
+				locations: parseLocations(update.locations),
+				rawInput: update.rawInput,
+				rawOutput: update.rawOutput,
+			};
+		case "usage_update":
+			if (typeof update.used !== "number" || !Number.isFinite(update.used) || update.used < 0) return null;
+			return {
+				type: "usage_update",
+				used: update.used,
+				size: Number.isSafeInteger(update.size) && (update.size as number) > 0 ? (update.size as number) : undefined,
 			};
 		default:
 			return null;
@@ -219,6 +308,31 @@ export interface AcpAgentInfo {
 	version: string;
 	/** Methods the client may pass to `authenticate` when the agent reports `auth_required`. */
 	authMethods: AcpAuthMethod[];
+	capabilities: AcpAgentCapabilities;
+}
+
+export interface AcpAgentCapabilities {
+	/** MCP over HTTP; stdio is supported by every agent. */
+	mcpHttp: boolean;
+	image: boolean;
+	/** `session/new` accepts `systemPrompt` (append mode). */
+	systemPrompt: boolean;
+	/** `_session/steering` injects a message into the running turn. */
+	steering: boolean;
+}
+
+function parseCapabilities(record: Record<string, unknown>): AcpAgentCapabilities {
+	const caps = isRecord(record.agentCapabilities) ? record.agentCapabilities : {};
+	const mcp = isRecord(caps.mcpCapabilities) ? caps.mcpCapabilities : {};
+	const prompt = isRecord(caps.promptCapabilities) ? caps.promptCapabilities : {};
+	const session = isRecord(caps.sessionCapabilities) ? caps.sessionCapabilities : {};
+	const meta = isRecord(record._meta) ? record._meta : {};
+	return {
+		mcpHttp: mcp.http === true,
+		image: prompt.image === true,
+		systemPrompt: isRecord(session.systemPrompt),
+		steering: isRecord(meta.steering) && meta.steering.supported === true,
+	};
 }
 
 function parseAuthMethods(value: unknown): AcpAuthMethod[] {
@@ -238,6 +352,7 @@ export function parseInitializeResult(result: unknown): AcpAgentInfo {
 		name: optionalString(info.name) ?? "unknown-agent",
 		version: optionalString(info.version) ?? "0.0.0",
 		authMethods: parseAuthMethods(record.authMethods),
+		capabilities: parseCapabilities(record),
 	};
 }
 
@@ -318,7 +433,10 @@ export function parseSessionConfig(result: unknown, previous: AcpSessionConfig =
 	const keptModel = !hasConfigOptions || previous.model?.configId === null ? previous.model : undefined;
 	return {
 		model: findSelect(result.configOptions, "model") ?? parseLegacyModels(result.models) ?? keptModel,
-		thoughtLevel: hasConfigOptions ? findSelect(result.configOptions, "thought_level") : previous.thoughtLevel,
+		// Mistral Vibe names the category "thinking" instead of the spec's "thought_level".
+		thoughtLevel: hasConfigOptions
+			? (findSelect(result.configOptions, "thought_level") ?? findSelect(result.configOptions, "thinking"))
+			: previous.thoughtLevel,
 	};
 }
 
@@ -341,4 +459,29 @@ export type AcpStopReason = (typeof STOP_REASONS)[number];
 /** Unknown or missing reasons count as `end_turn`. */
 export function parseStopReason(result: unknown): AcpStopReason {
 	return oneOf(STOP_REASONS, isRecord(result) ? result.stopReason : undefined) ?? "end_turn";
+}
+
+/** Token counts of a turn, from the (unstable) `usage` of a `session/prompt` result. */
+export interface AcpUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+export function parsePromptUsage(result: unknown): AcpUsage | undefined {
+	const usage = isRecord(result) && isRecord(result.usage) ? result.usage : undefined;
+	if (!usage) return undefined;
+	const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
+	return {
+		input: count(usage.inputTokens),
+		output: count(usage.outputTokens),
+		cacheRead: count(usage.cachedReadTokens),
+		cacheWrite: count(usage.cachedWriteTokens),
+	};
+}
+
+/** `_session/steering` result: whether the message joined the running turn. */
+export function parseSteerOutcome(result: unknown): "steered" | "promptRequired" {
+	return isRecord(result) && result.outcome === "promptRequired" ? "promptRequired" : "steered";
 }
