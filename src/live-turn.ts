@@ -3,7 +3,7 @@ import type { ToolCall, Usage, UserMessage } from "@earendil-works/pi-ai";
 import { AcpRpcError, type AcpClient, type PromptResult, type SessionInstance } from "./acp-client.ts";
 import { emptyToolContent, isFinalStatus, type AcpAgentInfo, type AcpSessionUpdate } from "./acp.ts";
 import { PI_MCP_SERVER, type AcpAgentConfig } from "./config.ts";
-import { addUsage, failTurn, finishTurn, type MessageWriter } from "./message-writer.ts";
+import { addUsage, failTurn, finishTurn, zeroUsage, type MessageWriter } from "./message-writer.ts";
 import type { McpCallResult } from "./mcp-server.ts";
 import { ACP_TOOL_NAME, compactInput, type AcpToolArgs, type AcpToolState, type AwaitTool } from "./native-tools.ts";
 import { MAX_STEER_REJECTIONS, noteStreamed, type PendingSteers, type SyncState } from "./session-sync.ts";
@@ -79,7 +79,12 @@ interface TurnPrompt {
 	steers: readonly string[];
 }
 
-export interface LiveTurn {
+export type LiveTurnSetup = Pick<
+	LiveTurn,
+	"key" | "agent" | "modelId" | "acp" | "sessionId" | "instance" | "controller" | "native" | "steering" | "onRawUpdate"
+>;
+
+export class LiveTurn {
 	/** `turnKey(agent id, Pi's StreamOptions.sessionId or "")`: the turn's slot in `lives`, `claims`, `served` and `pendingSteers`. */
 	key: string;
 	agent: AcpAgentConfig;
@@ -94,38 +99,51 @@ export interface LiveTurn {
 	 * WARN: it must outlive that message: while Pi runs a Pi tool call between messages, it is the only
 	 * link that cancels the ACP turn. Only a new `attach`, `settleTurn` or the turn's replacement drops it.
 	 */
-	unbindAbort: (() => void) | undefined;
+	unbindAbort: (() => void) | undefined = undefined;
 	native: boolean;
 	steering: boolean;
 	/** Events that arrived while no Pi message was attached (Pi was running tools). */
-	buffer: TurnEvent[];
-	attached: { consume: (event: TurnEvent) => void; finish: (outcome: TurnOutcome) => void } | null;
-	outcome: TurnOutcome | null;
+	buffer: TurnEvent[] = [];
+	attached: { consume: (event: TurnEvent) => void; finish: (outcome: TurnOutcome) => void } | null = null;
+	outcome: TurnOutcome | null = null;
 	/** Whether a `session/prompt` of this turn is in flight. */
-	running: boolean;
+	running: boolean = false;
 	/**
 	 * Whether the session's traffic belongs to this turn: false until its first prompt is sent,
 	 * because until then the session may still be draining a cancelled prompt.
 	 */
-	accepting: boolean;
+	accepting: boolean = false;
 	/** Prompts to send, in order, once the running one ends (steering the agent could not take mid-turn). */
-	queued: TurnPrompt[];
-	tools: Map<string, ToolEntry>;
+	queued: TurnPrompt[] = [];
+	tools: Map<string, ToolEntry> = new Map();
 	/**
 	 * Mirrored calls by the id Pi knows them by: unique per call, since ACP ids are unique per session at
 	 * best and Pi's tool results and `awaitTool` must find the one turn they belong to.
 	 */
-	mirrors: Map<string, ToolEntry>;
+	mirrors: Map<string, ToolEntry> = new Map();
 	/** Pi tool calls still waiting for Pi's result; the agent may cancel one or end the turn first. */
-	piCalls: Map<string, PiCall>;
+	piCalls: Map<string, PiCall> = new Map();
 	/** Every Pi tool call this turn handed to Pi: Pi answers each, even once its MCP request is gone. */
-	issued: Set<string>;
-	usage: Usage;
+	issued: Set<string> = new Set();
+	usage: Usage = zeroUsage();
 	/** The agent's latest `usage_update.used`: what its context holds now. */
-	contextUsed: number | undefined;
+	contextUsed: number | undefined = undefined;
 	onRawUpdate: ((params: unknown) => void) | undefined;
 	/** Told to the user when the turn ends in an error, after the error itself. */
-	notice: string | undefined;
+	notice: string | undefined = undefined;
+
+	constructor(setup: LiveTurnSetup) {
+		this.key = setup.key;
+		this.agent = setup.agent;
+		this.modelId = setup.modelId;
+		this.acp = setup.acp;
+		this.sessionId = setup.sessionId;
+		this.instance = setup.instance;
+		this.controller = setup.controller;
+		this.native = setup.native;
+		this.steering = setup.steering;
+		this.onRawUpdate = setup.onRawUpdate;
+	}
 }
 
 /** Renders tool activity as short inline notices in the reply text. */

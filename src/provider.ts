@@ -81,7 +81,7 @@ import {
 	type PromptPart,
 	type SyncState,
 } from "./session-sync.ts";
-import { PI_TOOL_NAME, createTurnLifecycle, piToolRef, type LiveTurn } from "./live-turn.ts";
+import { LiveTurn, PI_TOOL_NAME, createTurnLifecycle, piToolRef } from "./live-turn.ts";
 import { conversation, messageKey, renderTranscript, tagged, userBlocks, type AcpContentBlock } from "./transcript.ts";
 
 export { piToolRef } from "./live-turn.ts";
@@ -582,7 +582,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		const sentSteers = sent.flatMap((part) => (part.steer === undefined ? [] : [part.steer]));
 
-		const turn: LiveTurn = {
+		const turn = new LiveTurn({
 			key,
 			agent,
 			modelId: model.id,
@@ -590,24 +590,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			sessionId,
 			instance,
 			controller: claim,
-			unbindAbort: undefined,
 			native: options.nativeTools?.() === true,
 			steering: info.capabilities.steering,
-			buffer: [],
-			attached: null,
-			outcome: null,
-			running: false,
-			accepting: false,
-			queued: [],
-			tools: new Map(),
-			mirrors: new Map(),
-			piCalls: new Map(),
-			issued: new Set(),
-			usage: zeroUsage(),
-			contextUsed: undefined,
 			onRawUpdate,
-			notice: undefined,
-		};
+		});
 		lives.set(key, turn);
 		startPrompt(turn, { payload, commit: () => prompt.commit(sent), steers: sentSteers });
 		attach(turn, writer, signal);
