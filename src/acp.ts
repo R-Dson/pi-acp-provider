@@ -85,6 +85,10 @@ export type AcpSessionUpdate =
 			type: "tool_call" | "tool_call_update";
 			toolCallId: string;
 			title: string | undefined;
+			/** The agent's internal tool name, when it sends one (`name`, or Claude's `_meta.claudeCode.toolName`). */
+			toolName: string | undefined;
+			/** Every structured identity the update carries, for authorization (see `structuredToolIdentities`). */
+			toolIdentities: unknown[];
 			status: ToolCallStatus | undefined;
 			summary: string;
 			/** ACP `ToolKind` (read, edit, execute, ...), when the agent sends one. */
@@ -185,6 +189,20 @@ function parseLocations(locations: unknown): AcpToolLocation[] | undefined {
 	);
 }
 
+function claudeToolName(meta: unknown): string | undefined {
+	return isRecord(meta) && isRecord(meta.claudeCode) ? optionalString(meta.claudeCode.toolName) : undefined;
+}
+
+/**
+ * Every structured tool identity a tool call record carries, whatever its type: ACP `name` and Claude's
+ * `_meta.claudeCode.toolName`, in that order, each when present.
+ * WARN: authorization must check all of them; picking one lets a conflicting other field go unseen.
+ */
+export function structuredToolIdentities(record: Record<string, unknown>): unknown[] {
+	const meta = isRecord(record._meta) && isRecord(record._meta.claudeCode) ? record._meta.claudeCode : undefined;
+	return [record.name, meta?.toolName].filter((identity) => identity !== undefined);
+}
+
 export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 	const update = updateOf(params);
 	switch (update?.sessionUpdate) {
@@ -198,6 +216,8 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 				type: update.sessionUpdate,
 				toolCallId: update.toolCallId,
 				title: optionalString(update.title),
+				toolName: optionalString(update.name) ?? claudeToolName(update._meta),
+				toolIdentities: structuredToolIdentities(update),
 				status: oneOf(TOOL_CALL_STATUSES, update.status),
 				summary: toolContentSummary(update.content),
 				kind: optionalString(update.kind),
@@ -275,6 +295,27 @@ export interface AcpAgentInfo {
 	version: string;
 	/** Methods the client may pass to `authenticate` when the agent reports `auth_required`. */
 	authMethods: AcpAuthMethod[];
+	capabilities: AcpAgentCapabilities;
+}
+
+export interface AcpAgentCapabilities {
+	/** MCP over HTTP; stdio is supported by every agent. */
+	mcpHttp: boolean;
+	image: boolean;
+	/** `session/new` accepts `systemPrompt` (append mode). */
+	systemPrompt: boolean;
+}
+
+function parseCapabilities(record: Record<string, unknown>): AcpAgentCapabilities {
+	const caps = isRecord(record.agentCapabilities) ? record.agentCapabilities : {};
+	const mcp = isRecord(caps.mcpCapabilities) ? caps.mcpCapabilities : {};
+	const prompt = isRecord(caps.promptCapabilities) ? caps.promptCapabilities : {};
+	const session = isRecord(caps.sessionCapabilities) ? caps.sessionCapabilities : {};
+	return {
+		mcpHttp: mcp.http === true,
+		image: prompt.image === true,
+		systemPrompt: isRecord(session.systemPrompt),
+	};
 }
 
 function parseAuthMethods(value: unknown): AcpAuthMethod[] {
@@ -294,6 +335,7 @@ export function parseInitializeResult(result: unknown): AcpAgentInfo {
 		name: optionalString(info.name) ?? "unknown-agent",
 		version: optionalString(info.version) ?? "0.0.0",
 		authMethods: parseAuthMethods(record.authMethods),
+		capabilities: parseCapabilities(record),
 	};
 }
 
@@ -400,4 +442,24 @@ export type AcpStopReason = (typeof STOP_REASONS)[number];
 /** Unknown or missing reasons count as `end_turn`. */
 export function parseStopReason(result: unknown): AcpStopReason {
 	return oneOf(STOP_REASONS, isRecord(result) ? result.stopReason : undefined) ?? "end_turn";
+}
+
+/** Token counts of a turn, from the (unstable) `usage` of a `session/prompt` result. */
+export interface AcpUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+export function parsePromptUsage(result: unknown): AcpUsage | undefined {
+	const usage = isRecord(result) && isRecord(result.usage) ? result.usage : undefined;
+	if (!usage) return undefined;
+	const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
+	return {
+		input: count(usage.inputTokens),
+		output: count(usage.outputTokens),
+		cacheRead: count(usage.cachedReadTokens),
+		cacheWrite: count(usage.cachedWriteTokens),
+	};
 }
