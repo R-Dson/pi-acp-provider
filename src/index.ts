@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { autoReject } from "./acp.ts";
 import { loadSettings, resolveConfig } from "./config.ts";
+import { ACP_TOOL_NAME, createAcpToolDefinition } from "./native-tools.ts";
 import { ACP_PROVIDER_ID, createAcpProvider, type PermissionPolicy } from "./provider.ts";
 
 type PermissionUi = Pick<ExtensionUIContext, "select">;
@@ -40,8 +41,11 @@ export default function acpExtension(pi: ExtensionAPI): void {
 		config,
 		log,
 		...(config.autoApproveTools ? {} : { permissionPolicy: interactivePolicy(() => ui) }),
+		// Without the active mirror tool, Pi would answer the tool calls with "not found".
+		nativeTools: () => config.nativeTools && pi.getActiveTools().includes(ACP_TOOL_NAME),
 	});
 	pi.registerProvider(handle.provider);
+	if (config.nativeTools) pi.registerTool(createAcpToolDefinition(handle.awaitTool));
 
 	// `/<agent id> <command>` runs a slash command the agent advertised
 	// (e.g. Copilot's `/context`) by sending it to the agent as the prompt.

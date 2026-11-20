@@ -98,6 +98,7 @@ Global keys:
 |---|---|---|---|
 | `autoApproveTools` | `ACP_AUTO_APPROVE` | `true` | When `false`, each permission request opens a select dialog (TUI/RPC) or is denied (print/JSON mode). |
 | `handshakeTimeoutMs` | | `30000` | Milliseconds to wait for `initialize`, `session/new`, and model or thinking-level changes. |
+| `nativeTools` | `ACP_NATIVE_TOOLS` | `true` | Show agent tool calls as native Pi tool rows. `false` restores the inline text notices. |
 | | `ACP_DEBUG=1` | off | Wire diagnostics on stderr. |
 
 ## Behavior
@@ -112,11 +113,20 @@ Global keys:
   turn sends only the new user message, because the agent keeps conversation
   history on its side. Image attachments are noted but not forwarded.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
-  maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Tool
-  calls render as `⚙️ Executing [title]...` and, on completion,
-  `✓ title: <first line of output>` (or `✗` on failure), including calls
-  reported already finished. Other update kinds (plans, mode changes) are
-  ignored.
+  maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other
+  update kinds (plans, mode changes) are ignored.
+- **Tool calls** (`nativeTools`, the default): each agent tool call is a native
+  Pi tool row. The provider ends the Pi message at the call with a `toolCall`
+  block for the `acp_tool` mirror tool. Pi runs that tool, which waits for the
+  agent's final report and returns its output or file diffs, and then calls
+  the provider again, which continues the same ACP turn from buffered
+  updates. One ACP turn therefore spans several Pi messages. The row shows the
+  ACP kind, title and locations; the result shows diffs (Pi's diff renderer),
+  text output with live partial updates, and failures. Expand the row to see
+  the raw input and full output. `acp_tool` hides its own declaration, so no
+  model is offered it; if it is not active (for example with a `--tools`
+  allowlist), or with `nativeTools: false`, tool calls render inline as
+  `⚙️ Executing [title]...` and `✓ title: <first line of output>`.
 - **Abort**: Pi's abort signal (Ctrl+C) sends `session/cancel` and finalizes
   the message as aborted immediately. It answers any open permission prompt
   with `cancelled` and leaves the session usable. The next prompt waits (up to
@@ -151,7 +161,7 @@ Global keys:
 
 ```bash
 npm run typecheck   # strict tsc, no emit
-npm test            # node:test suite against a scripted fake ACP agent
+npm test            # node:test suite against a scripted fake ACP agent (Node 22.6+)
 ```
 
 The fake agent (`test/fake-agent.mjs`) speaks ACP v1 wire shapes and covers

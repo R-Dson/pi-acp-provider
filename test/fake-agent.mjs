@@ -10,6 +10,7 @@
  *   - "MAXTOKENS"   finishes with stopReason "max_tokens"
  *   - "REFUSAL"     finishes with stopReason "refusal"
  *   - "ONESHOT"     first reports a tool call that is already completed
+ *   - "DIFF"        first reports an edit tool call with a diff
  *   - FAKE_SPLIT=1  writes stdout in small split chunks (line-buffer test)
  *   - FAKE_MODELS=config  session/new returns configOptions (model + thought_level)
  *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
@@ -150,6 +151,17 @@ async function handlePrompt(message) {
 			status: "completed",
 			content: [{ type: "content", content: { type: "text", text: "2 notes" } }],
 		});
+	}
+	if (text.includes("DIFF")) {
+		steps.unshift(
+			{ sessionUpdate: "tool_call", toolCallId: "e1", title: "Edit notes.txt", kind: "edit", status: "in_progress", locations: [{ path: "/tmp/notes.txt", line: 2 }] },
+			{
+				sessionUpdate: "tool_call_update",
+				toolCallId: "e1",
+				status: "completed",
+				content: [{ type: "diff", path: "/tmp/notes.txt", oldText: "one\ntwo\n", newText: "one\nTWO\n" }],
+			},
+		);
 	}
 	for (const step of steps) {
 		if (turn.finished) return;

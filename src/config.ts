@@ -29,6 +29,8 @@ export interface AcpProviderConfig {
 	handshakeTimeoutMs: number;
 	/** Wire diagnostics on stderr (`ACP_DEBUG`). */
 	debug: boolean;
+	/** Show agent tool calls as native Pi tool rows (`ACP_NATIVE_TOOLS`); inline text otherwise. */
+	nativeTools: boolean;
 }
 
 export type AcpAgentSettings = Partial<Omit<AcpAgentConfig, "id" | "command">> & { command: string };
@@ -38,11 +40,13 @@ export type AcpSettings = Partial<{
 	agents: Record<string, AcpAgentSettings>;
 	autoApproveTools: boolean;
 	handshakeTimeoutMs: number;
+	nativeTools: boolean;
 }>;
 
 const DEFAULTS = {
 	autoApproveTools: true,
 	handshakeTimeoutMs: 30_000,
+	nativeTools: true,
 } as const;
 
 const isStringArray = (value: unknown): value is string[] =>
@@ -78,6 +82,7 @@ export function parseSettings(value: unknown): AcpSettings {
 		settings.agents = Object.fromEntries(agents);
 	}
 	if (typeof value.autoApproveTools === "boolean") settings.autoApproveTools = value.autoApproveTools;
+	if (typeof value.nativeTools === "boolean") settings.nativeTools = value.nativeTools;
 	const timeout = value.handshakeTimeoutMs;
 	if (typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0) settings.handshakeTimeoutMs = timeout;
 	return settings;
@@ -127,5 +132,6 @@ export function resolveConfig({
 			parseBooleanFlag(env.ACP_AUTO_APPROVE) ?? settings.autoApproveTools ?? DEFAULTS.autoApproveTools,
 		handshakeTimeoutMs: settings.handshakeTimeoutMs ?? DEFAULTS.handshakeTimeoutMs,
 		debug: parseBooleanFlag(env.ACP_DEBUG) ?? false,
+		nativeTools: parseBooleanFlag(env.ACP_NATIVE_TOOLS) ?? settings.nativeTools ?? DEFAULTS.nativeTools,
 	};
 }
