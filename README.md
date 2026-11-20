@@ -329,7 +329,13 @@ real agent or network is needed.
 
 - `src/acp.ts`: ACP v1 / JSON-RPC wire types and boundary parsers
 - `src/acp-client.ts`: child process, NDJSON transport, handshake, sessions, auth
-- `src/provider.ts`: the Pi `Provider` (agents and their discovered models), model and thinking-level selection, and event translation
+- `src/provider.ts`: the Pi `Provider`: agent clients, session opening, turn dispatch and steering, and isolated requests
+- `src/models.ts`: model discovery, model ids, context windows, and model and thinking-level selection
+- `src/live-turn.ts`: an ACP turn that spans several Pi messages, and the translation of its updates into Pi events
+- `src/message-writer.ts`: writes the Pi assistant message, usage, and how a turn ends
+- `src/session-sync.ts`: what each ACP session has seen, divergence checks, pending steers, and prompt building
+- `src/pi-tool-bridge.ts`: Pi tool calls from the MCP server, per-session tool wiring and nonces, and Pi tool permission checks
+- `src/native-tools.ts`: the `acp_tool` mirror tool that shows agent tool calls as Pi tool rows
 - `src/config.ts`: settings, env resolution, and agent presets
 - `src/mcp-server.ts`, `src/mcp-relay.mjs`: Pi's MCP server (HTTP and stdio relay)
 - `src/transcript.ts`: Pi messages to ACP prompt blocks and history transcripts
