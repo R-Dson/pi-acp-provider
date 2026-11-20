@@ -101,14 +101,15 @@ const BASELINE: Required<Pick<AgentPreset, "piTools" | "mcpTransport" | "systemP
  */
 export const AGENT_PRESETS: Readonly<Record<string, AgentPreset>> = {
 	// Claude Code runs on Pi's tools alone: `tools: []` removes its built-ins,
-	// `strictMcpConfig` ignores MCP servers from its own config, and Pi's server
-	// is pre-approved.
+	// `strictMcpConfig` ignores MCP servers from its own config, the cloud
+	// connector loader is switched off by env, and Pi's server is pre-approved.
 	"claude-agent-acp": {
 		piTools: "pi",
 		mcpTransport: "http",
 		systemPrompt: "session",
 		sessionMeta: { claudeCode: { options: { allowedTools: [`mcp__${PI_MCP_SERVER}`] } } },
 		ownToolsOffMeta: { claudeCode: { options: { tools: [], strictMcpConfig: true } } },
+		env: { ENABLE_CLAUDEAI_MCP_SERVERS: "0" },
 	},
 	// Codex has no documented ACP switch for its built-in tools, so it keeps them.
 	"codex-acp": {

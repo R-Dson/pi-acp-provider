@@ -124,6 +124,112 @@ test("agents run as separate processes with separate sessions", async () => {
 	assert.equal(second.message.model, "other");
 });
 
+/** Streams a SLOW prompt with `first`, and once it is under way an ECHO prompt with `second`; both to completion. */
+async function overlapping(
+	handle: AcpProviderHandle,
+	first: { model: Model<Api>; sessionId?: string },
+	second: { model: Model<Api>; sessionId?: string },
+) {
+	let started: () => void = () => {};
+	const underWay = new Promise<void>((resolve) => (started = resolve));
+	const slow = (async () => {
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of handle.provider.streamSimple(first.model, userContext("SLOW one"), first.sessionId ? { sessionId: first.sessionId } : {})) {
+			events.push(event);
+			if (event.type === "thinking_delta") started();
+		}
+		started();
+		return events.at(-1);
+	})();
+	await underWay;
+	const echo = (await collect(handle.provider.streamSimple(second.model, userContext("ECHO two"), second.sessionId ? { sessionId: second.sessionId } : {}))).at(-1);
+	return { slow: await slow, echo };
+}
+
+for (const sessionId of [undefined, "conv"]) {
+	test(`concurrent streams on two agents both complete with their own output (${sessionId ? "same session id" : "no session id"})`, async () => {
+		const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+		const [fake, other] = handle.provider.getModels();
+		assert.ok(fake && other);
+		const { slow, echo } = await overlapping(handle, { model: fake, ...(sessionId ? { sessionId } : {}) }, { model: other, ...(sessionId ? { sessionId } : {}) });
+		assert.ok(slow?.type === "done", `the first stream ends with ${slow?.type}`);
+		assert.match(messageText(slow.message), /Hello world #0/);
+		assert.doesNotMatch(messageText(slow.message), /ECHO/);
+		assert.ok(echo?.type === "done");
+		assert.match(messageText(echo.message), /ECHO\[sess-1\]<<<.*ECHO two/s);
+	});
+}
+
+test("a request replacing one paused in onPayload owns the turn, and the paused one ends aborted while its hook still waits", async () => {
+	const handle = makeProvider();
+	const model = firstModel(handle);
+	let release: () => void = () => {};
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let paused: () => void = () => {};
+	const reached = new Promise<void>((resolve) => (paused = resolve));
+	const first = collect(
+		handle.provider.streamSimple(model, userContext("ECHO first"), {
+			sessionId: "conv",
+			onPayload: async () => {
+				paused();
+				await gate;
+				return undefined;
+			},
+		}),
+	);
+	await reached;
+	let started: () => void = () => {};
+	const underWay = new Promise<void>((resolve) => (started = resolve));
+	const second = (async () => {
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of handle.provider.streamSimple(model, userContext("SLOW second"), { sessionId: "conv" })) {
+			events.push(event);
+			if (event.type === "thinking_delta") started();
+		}
+		started();
+		return events.at(-1);
+	})();
+	await underWay;
+	const ended = await Promise.race([first, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000))]);
+	release();
+	const firstLast = ended?.at(-1);
+	assert.ok(firstLast?.type === "error", `the replaced request ends with ${firstLast?.type ?? "nothing while its hook waits"}`);
+	assert.equal(firstLast.reason, "aborted", firstLast.error.errorMessage ?? "");
+	const secondLast = await second;
+	assert.ok(secondLast?.type === "done", `the replacing request ends with ${secondLast?.type}`);
+	assert.match(messageText(secondLast.message), /Hello world #0/);
+});
+
+test("concurrent streams on two conversations of one agent run in separate sessions", async () => {
+	const handle = makeProvider();
+	const model = firstModel(handle);
+	const { slow, echo } = await overlapping(handle, { model, sessionId: "conv-a" }, { model, sessionId: "conv-b" });
+	assert.ok(slow?.type === "done", `the first stream ends with ${slow?.type}`);
+	assert.match(messageText(slow.message), /Hello world #0/);
+	assert.doesNotMatch(messageText(slow.message), /ECHO/);
+	assert.ok(echo?.type === "done");
+	const echoSession = /ECHO\[(sess-\d+)\]<<<.*ECHO two/s.exec(messageText(echo.message))?.[1];
+	assert.ok(echoSession);
+	const again = (await collect(handle.provider.streamSimple(model, userContext("ECHO three"), { sessionId: "conv-a" }))).at(-1);
+	assert.ok(again?.type === "done");
+	const slowSession = /ECHO\[(sess-\d+)\]/.exec(messageText(again.message))?.[1];
+	assert.ok(slowSession);
+	assert.notEqual(slowSession, echoSession, "each conversation keeps its own ACP session");
+});
+
+test("each agent's session gets Pi's instructions even when session ids collide", async () => {
+	const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+	const [fake, other] = handle.provider.getModels();
+	assert.ok(fake && other);
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "ECHO hi" }], timestamp: Date.now() }];
+	const context = normalizeContext({ systemPrompt: "Be brief.", messages });
+	for (const model of [fake, other]) {
+		const last = (await collect(handle.provider.streamSimple(model, context, {}))).at(-1);
+		assert.ok(last?.type === "done");
+		assert.match(messageText(last.message), /ECHO\[sess-1\]<<<.*<system-instructions>/s, `${model.id} gets the system prompt`);
+	}
+});
+
 test("a tool call reported already completed renders its result", async () => {
 	const handle = makeProvider();
 	const last = await lastEvent(handle, "ONESHOT go");
@@ -162,6 +268,23 @@ test("abort mid-stream finalizes as aborted and the session survives", async () 
 	assert.equal(last.reason, "aborted");
 	assert.equal(last.error.stopReason, "aborted");
 	assert.equal((await lastEvent(handle, "still here"))?.type, "done");
+});
+
+test("after a reset, a restarted agent's session that reuses an old id gets the instructions and history again", async () => {
+	const handle = makeProvider();
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "ECHO one" }], timestamp: Date.now() }];
+	const run = async () =>
+		(await collect(handle.provider.streamSimple(firstModel(handle), normalizeContext({ systemPrompt: "SYSTEM-RULES", messages }), {}))).at(-1);
+	const first = await run();
+	assert.ok(first?.type === "done");
+	assert.match(messageText(first.message), /^ECHO\[sess-1\]<<<<system-instructions>/);
+	handle.resetSession(process.cwd());
+	// WHY: the fake numbers sessions per process, so once it restarts its next session is sess-1 again.
+	assert.equal((await lastEvent(handle, "CRASH out"))?.type, "error");
+	messages.push(first.message, { role: "user", content: [{ type: "text", text: "ECHO two" }], timestamp: Date.now() + 1 });
+	const second = await run();
+	assert.ok(second?.type === "done", JSON.stringify(second));
+	assert.match(messageText(second.message), /^ECHO\[sess-1\]<<<<system-instructions>[\s\S]*SYSTEM-RULES[\s\S]*<conversation-history>[\s\S]*ECHO one[\s\S]*ECHO two>>>$/);
 });
 
 test("process crash surfaces as an error and the next prompt recovers", async () => {
@@ -325,12 +448,14 @@ test("picking a discovered model and thinking level switches the session", async
 	await handle.provider.refreshModels?.(storeContext().context);
 	const smart = handle.provider.getModels().find((model) => model.id === "fake/smart");
 	assert.ok(smart);
-	const first = await collect(handle.provider.streamSimple(smart, userContext("hi"), { reasoning: "high" }));
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }];
+	const first = await collect(handle.provider.streamSimple(smart, normalizeContext({ messages }), { reasoning: "high" }));
 	const done = first.at(-1);
 	assert.ok(done?.type === "done");
 	assert.match(messageText(done.message), /\[model=smart thought=high\]/);
-	// The bare agent model goes back to the agent's default; no reasoning means off.
-	const back = await lastEvent(handle, "again", firstModel(handle));
+	// The bare agent model goes back to the agent's default in the same conversation; no reasoning means off.
+	messages.push(done.message, { role: "user", content: [{ type: "text", text: "again" }], timestamp: Date.now() + 1 });
+	const back = (await collect(handle.provider.streamSimple(firstModel(handle), normalizeContext({ messages }), {}))).at(-1);
 	assert.ok(back?.type === "done");
 	assert.match(messageText(back.message), /\[model=fast thought=none\]/);
 });
@@ -499,4 +624,127 @@ test("native tools: aborting while Pi waits on a mirrored call aborts the turn",
 	const waiting = handle.awaitTool(call.id, controller.signal, () => {});
 	controller.abort();
 	await assert.rejects(waiting, /aborted/);
+});
+
+test("native tools: two conversations' mirrored calls get distinct ids and stay with their own turn", async () => {
+	const handle = makeProvider(undefined, { nativeTools: () => true });
+	const model = firstModel(handle);
+	const opening = async (text: string, sessionId: string) => {
+		const messages: Message[] = [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }];
+		const last = (await collect(handle.provider.streamSimple(model, normalizeContext({ messages }), { sessionId }))).at(-1);
+		assert.ok(last?.type === "done" && last.reason === "toolUse");
+		const call = last.message.content.at(-1);
+		assert.ok(call?.type === "toolCall");
+		return { messages: [...messages, last.message], call };
+	};
+	const a = await opening("go a", "conv-a");
+	const b = await opening("go b", "conv-b");
+	assert.notEqual(a.call.id, b.call.id, "the agent reported both calls as t1");
+	const controller = new AbortController();
+	const waiting = handle.awaitTool(b.call.id, controller.signal, () => {});
+	controller.abort();
+	await assert.rejects(waiting, /aborted/);
+	const result = toToolResult(await handle.awaitTool(a.call.id, undefined, () => {}));
+	assert.equal(result.details.output, "3 matches\nsecond line");
+	a.messages.push({
+		role: "toolResult",
+		toolCallId: a.call.id,
+		toolName: a.call.name,
+		content: result.content,
+		details: result.details,
+		isError: false,
+		timestamp: Date.now(),
+	} as Message);
+	const last = (await collect(handle.provider.streamSimple(model, normalizeContext({ messages: a.messages }), { sessionId: "conv-a" }))).at(-1);
+	assert.ok(last?.type === "done", `conversation a ends with ${last?.type}`);
+	assert.match(messageText(last.message), /^Hello world #\d+$/);
+});
+
+test("a prompt prepared before the agent restarted is not sent into another conversation's new session of the same id", async () => {
+	const handle = makeProvider();
+	const model = firstModel(handle);
+	let release: () => void = () => {};
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let paused: () => void = () => {};
+	const reached = new Promise<void>((resolve) => (paused = resolve));
+	const held = collect(
+		handle.provider.streamSimple(model, userContext("ECHO held"), {
+			sessionId: "conv-a",
+			onPayload: async () => {
+				paused();
+				await gate;
+				return undefined;
+			},
+		}),
+	);
+	await reached;
+	const crashed = (await collect(handle.provider.streamSimple(model, userContext("CRASH now"), { sessionId: "conv-b" }))).at(-1);
+	assert.equal(crashed?.type, "error");
+	const fresh = (await collect(handle.provider.streamSimple(model, userContext("ECHO fresh"), { sessionId: "conv-c" }))).at(-1);
+	assert.ok(fresh?.type === "done");
+	assert.match(messageText(fresh.message), /^ECHO\[sess-1\]<<</, "the respawned agent reuses the held request's session id");
+	release();
+	const last = (await held).at(-1);
+	assert.ok(last?.type === "error", `the held request ends with ${last?.type}: ${last?.type === "done" ? messageText(last.message) : ""}`);
+	assert.match(last.error.errorMessage ?? "", /session sess-1 ended while the request was being prepared/);
+	const after = (await collect(handle.provider.streamSimple(model, userContext("ECHO after"), { sessionId: "conv-c" }))).at(-1);
+	assert.ok(after?.type === "done");
+	assert.doesNotMatch(messageText(after.message), /ECHO held/);
+});
+
+test("a replacement's model is applied after a superseded request's settings change lands", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config", FAKE_SETTING_DELAY: "300" } })]);
+	await handle.provider.refreshModels?.(storeContext().context);
+	const smart = handle.provider.getModels().find((candidate) => candidate.id === "fake/smart");
+	assert.ok(smart);
+	const bare = firstModel(handle);
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }];
+	const warm = (await collect(handle.provider.streamSimple(bare, normalizeContext({ messages }), { sessionId: "conv" }))).at(-1);
+	assert.ok(warm?.type === "done");
+	assert.match(messageText(warm.message), /\[model=fast /);
+	messages.push(warm.message, { role: "user", content: [{ type: "text", text: "SLOW again" }], timestamp: Date.now() + 1 });
+	const superseded = collect(handle.provider.streamSimple(smart, normalizeContext({ messages }), { sessionId: "conv" }));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	// WHY: the fake reads its model when a prompt starts, so the replacement's prompt waits until the
+	// superseded change (sent at about 0 ms, answered at 300 ms) has landed.
+	const replacement = (
+		await collect(
+			handle.provider.streamSimple(bare, normalizeContext({ messages }), {
+				sessionId: "conv",
+				onPayload: () => new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 400)),
+			}),
+		)
+	).at(-1);
+	assert.equal((await superseded).at(-1)?.type, "error");
+	assert.ok(replacement?.type === "done", `the replacement ends with ${replacement?.type}`);
+	assert.match(messageText(replacement.message), /\[model=fast /);
+});
+
+test("a hook that aborts its request and rejects ends the stream as aborted without an unhandled rejection", async () => {
+	const handle = makeProvider();
+	const unhandled: unknown[] = [];
+	const record = (reason: unknown): void => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", record);
+	try {
+		const controller = new AbortController();
+		const last = (
+			await collect(
+				handle.provider.streamSimple(firstModel(handle), userContext("ECHO hook"), {
+					signal: controller.signal,
+					onPayload: () => {
+						controller.abort();
+						return Promise.reject(new Error("hook failed"));
+					},
+				}),
+			)
+		).at(-1);
+		assert.ok(last?.type === "error");
+		assert.equal(last.reason, "aborted");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.deepEqual(unhandled.map(String), []);
+	} finally {
+		process.off("unhandledRejection", record);
+	}
 });
