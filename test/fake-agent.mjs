@@ -35,7 +35,8 @@
  *   - "SESSIONINFO" replies with JSON of the session's session/new params
  *   - "MCPCALL:<tool>:<json args>"  reports a tool call titled "mcp__pi__<tool>",
  *                   calls <tool> on the session's MCP server (stdio or http),
- *                   then replies "RESULT<<<text>>>"; result
+ *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
+ *                   when a _session/steering message arrived meanwhile); result
  *                   items are joined with "|", non-text ones as "[<type>:<mimeType>]"
  *   - "CALLREPORT"  with ECHO: first waits (up to 2s) until the last MCPCALL's tools/call got its
  *                   answer and its prompt got session/cancel, in whichever order they arrived, then
@@ -73,6 +74,7 @@
  *                   SIGTERM and writes its pid to <file> (POSIX only)
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
  *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
+ *   - FAKE_STEERING=1    advertises and accepts `_session/steering`
  */
 
 import { spawn } from "node:child_process";
@@ -150,6 +152,7 @@ let cancelledPermission = null;
 /** The last MCPCALL's tools/call answer and its prompt's session/cancel, reported by a CALLREPORT ECHO. */
 let lastCall = null;
 const sessionParams = new Map();
+const steered = [];
 
 /**
  * A tiny MCP client for one ACP McpServer entry: `request` resolves with the JSON-RPC response,
@@ -452,9 +455,10 @@ async function handlePrompt(message) {
 		const result = response.result ?? { content: [{ type: "text", text: callText(response) }], isError: true };
 		update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "m1", status: result.isError ? "failed" : "completed" });
 		const resultText = callText(response);
+		const extra = steered.length > 0 ? ` STEERED<<<${steered.splice(0).join("|")}>>>` : "";
 		update(sessionId, {
 			sessionUpdate: "agent_message_chunk",
-			content: { type: "text", text: `${perm}TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>` },
+			content: { type: "text", text: `${perm}TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
 		});
 		promptCounter++;
 		return turn.finish("end_turn");
@@ -553,6 +557,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 					...(process.env.FAKE_MCP_HTTP === "1" ? { mcpCapabilities: { http: true } } : {}),
 					...(process.env.FAKE_SYSPROMPT === "1" ? { sessionCapabilities: { systemPrompt: {} } } : {}),
 				},
+				...(process.env.FAKE_STEERING === "1" ? { _meta: { steering: { supported: true } } } : {}),
 				agentInfo: { name: `fake-agent-${process.pid}`, version: "0.0.1" },
 				authMethods: [{ id: "fake-login", name: "Fake login", description: "Pretend to sign in" }],
 			});
@@ -611,6 +616,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			if (FAIL_PROMPTS.has(++promptRequests)) replyError(message.id, -32603, `fake one-shot rejection of prompt #${promptRequests}`);
 			else void handlePrompt(message);
 			break;
+		case "_session/steering": {
+			if (process.env.FAKE_STEERING !== "1") {
+				replyError(message.id, -32601, "Method not found");
+				break;
+			}
+			const steerText = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
+			const running = activePrompts.get(message.params.sessionId);
+			if (running && !running.finished) {
+				steered.push(steerText);
+				reply(message.id, { outcome: "steered" });
+			} else reply(message.id, { outcome: "promptRequired", reason: "noRunningTurn" });
+			break;
+		}
 		case "session/cancel": {
 			const running = activePrompts.get(message.params?.sessionId);
 			running?.markCancelSeen();

@@ -609,6 +609,42 @@ test("compaction, which replaces the first message, starts a new session", async
 	assert.match(compacted.prompt, /^<conversation-history>[\s\S]*summary of the conversation so far[\s\S]*<\/conversation-history>\nECHO three$/);
 });
 
+test("steering reaches the running turn with _session/steering before the tool result", async () => {
+	const handle = makeProvider([agent({ env: { FAKE_STEERING: "1" } })]);
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages);
+	messages.push(first, ...(await answerTools(handle, first)), user("STEER-NOW"));
+	const last = textOf(await step(handle, messages));
+	assert.match(last, /RESULT<<<echoed hi>>> STEERED<<<STEER-NOW>>>/);
+});
+
+test("without steering support, a steer rides on the Pi tool result", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages);
+	messages.push(first, ...(await answerTools(handle, first)), user("STEER-NOW"));
+	const last = textOf(await step(handle, messages));
+	assert.match(last, /RESULT<<<echoed hi\|<user-message>[\s\S]*STEER-NOW[\s\S]*<\/user-message>>>>/);
+	assert.doesNotMatch(last, /STEERED/);
+});
+
+test("without steering support, a steer's image rides on the Pi tool result as an MCP image", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages);
+	const steer: Message = {
+		role: "user",
+		content: [
+			{ type: "text", text: "STEER-NOW" },
+			{ type: "image", data: "aGk=", mimeType: "image/png" },
+		],
+		timestamp: ++clock,
+	};
+	messages.push(first, ...(await answerTools(handle, first)), steer);
+	const last = textOf(await step(handle, messages));
+	assert.match(last, /RESULT<<<echoed hi\|<user-message>[\s\S]*STEER-NOW[\s\S]*<\/user-message>\|\[image:image\/png\]>>>/);
+});
+
 test("a steer after the agent's own tool call is sent as the next prompt once the turn ends", async () => {
 	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
 	const messages: Message[] = [user("hello")];
@@ -619,6 +655,17 @@ test("a steer after the agent's own tool call is sent as the next prompt once th
 	assert.equal(last.stopReason, "stop");
 	assert.match(textOf(last), /Hello world #0[\s\S]*ECHO\[sess-1\]<<<ECHO follow-up>>>/);
 });
+
+const LATE_STEER = /^Delivered late: [^\n]*\nSTEER-LATE\n/;
+
+/** Runs the agent's own tool turn of `first`, then queues the steer `steer` behind it. */
+async function queueSteer(handle: AcpProviderHandle, first: string, steer: string | Message = "STEER-LATE"): Promise<Message[]> {
+	const messages: Message[] = [user(first)];
+	const reply = await step(handle, messages);
+	assert.equal(reply.stopReason, "toolUse");
+	messages.push(reply, ...(await answerTools(handle, reply)), typeof steer === "string" ? user(steer) : steer);
+	return messages;
+}
 
 /** Streams `messages` and aborts on the first text delta; returns the aborted message. */
 async function abortAtText(handle: AcpProviderHandle, messages: Message[]): Promise<AssistantMessage> {
@@ -631,6 +678,105 @@ async function abortAtText(handle: AcpProviderHandle, messages: Message[]): Prom
 	assert.ok(last?.type === "error" && last.reason === "aborted", `expected aborted, got ${JSON.stringify(last)}`);
 	return last.error;
 }
+
+const occurrences = (text: string, part: string) => text.split(part).length - 1;
+
+test("a steer queued behind a turn that ends at max_tokens reaches the next prompt as a late user block", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "MAXTOKENS work");
+	const ended = await step(handle, messages);
+	assert.equal(ended.stopReason, "length");
+	messages.push(ended, user("ECHO next"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, LATE_STEER);
+	assert.match(next.prompt, /\nECHO next$/);
+	assert.doesNotMatch(next.prompt, /conversation-history/);
+	assert.equal(occurrences(next.prompt, "STEER-LATE"), 1);
+});
+
+test("a steer queued behind an aborted turn reaches the next prompt", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	messages.push(await abortAtText(handle, messages), user("ECHO next"));
+	const next = await capture(handle, messages);
+	assert.equal(next.message.stopReason, "stop");
+	assert.match(next.prompt, LATE_STEER);
+	assert.equal(occurrences(next.prompt, "STEER-LATE"), 1);
+});
+
+test("a steer whose follow-up prompt the agent rejects reaches the next prompt exactly once", async () => {
+	const handle = makeProvider([agent({ piTools: "off", env: { FAKE_FAIL_PROMPT_N: "2" } })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	const rejected = await capture(handle, messages);
+	assert.equal(rejected.message.stopReason, "error");
+	messages.push(rejected.message, user("ECHO next"));
+	const next = await capture(handle, messages);
+	assert.equal(next.message.stopReason, "stop");
+	assert.match(next.prompt, LATE_STEER);
+	assert.equal(occurrences(next.prompt, "STEER-LATE"), 1);
+	messages.push(next.message, user("ECHO again"));
+	assert.equal((await capture(handle, messages)).prompt, "ECHO again");
+});
+
+test("a steer the agent rejected twice is dropped and the user is told", async () => {
+	const handle = makeProvider([agent({ piTools: "off", env: { FAKE_FAIL_PROMPT_N: "2,3" } })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	const first = await capture(handle, messages);
+	assert.equal(first.message.stopReason, "error");
+	assert.doesNotMatch(first.message.errorMessage ?? "", /dropped/);
+	messages.push(first.message, user("ECHO next"));
+	const second = await capture(handle, messages);
+	assert.equal(second.message.stopReason, "error");
+	assert.match(second.message.errorMessage ?? "", /dropped 1 steering message\(s\) that Fake agent rejected 2 times: "STEER-LATE"/);
+	const retry = await capture(handle, messages);
+	assert.equal(retry.message.stopReason, "stop");
+	assert.equal(retry.prompt, "ECHO next");
+});
+
+test("a retry with no new user message sends a recovered steer once", async () => {
+	const handle = makeProvider([agent({ piTools: "off", env: { FAKE_FAIL_PROMPT_N: "2" } })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	const rejected = await capture(handle, messages);
+	assert.equal(rejected.message.stopReason, "error");
+	messages.push(rejected.message);
+	const retry = await capture(handle, messages);
+	assert.notEqual(retry.message.stopReason, "error");
+	assert.match(retry.prompt, /^Delivered late: [^\n]*\nSTEER-LATE$/);
+});
+
+test("a retry with no new user message does not resend a dropped steer", async () => {
+	const handle = makeProvider([agent({ piTools: "off", env: { FAKE_FAIL_PROMPT_N: "2,3" } })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	const first = await capture(handle, messages);
+	assert.equal(first.message.stopReason, "error");
+	messages.push(first.message);
+	const second = await capture(handle, messages);
+	assert.match(second.message.errorMessage ?? "", /dropped 1 steering message/);
+	const third = await capture(handle, messages);
+	assert.equal(third.message.stopReason, "error");
+	assert.match(third.message.errorMessage ?? "", /No user message left to send/);
+	assert.equal(third.prompt, "", "nothing reached the agent");
+});
+
+test("a steer pending when its session is replaced stays out of the new session's seed and follows it", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { cancelGraceMs: 300, nativeTools: () => true });
+	const messages = await queueSteer(handle, "IGNORE-CANCEL hello");
+	messages.push(await abortAtText(handle, messages), user("ECHO next"));
+	const next = await capture(handle, messages);
+	assert.equal(next.message.stopReason, "stop");
+	assert.match(textOf(next.message), /^ECHO\[sess-2\]/, "the drain timeout replaced the session");
+	assert.match(next.prompt, /^<conversation-history>[\s\S]*IGNORE-CANCEL hello[\s\S]*<\/conversation-history>\nDelivered late: [^\n]*\nSTEER-LATE\nECHO next$/);
+	assert.equal(occurrences(next.prompt, "STEER-LATE"), 1);
+});
+
+test("a pending steer a fork removed from Pi's branch is not sent", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "MAXTOKENS work");
+	assert.equal((await step(handle, messages)).stopReason, "length");
+	const forked = await capture(handle, [...messages.slice(0, 2), user("ECHO other")]);
+	assert.equal(forked.message.stopReason, "stop");
+	assert.doesNotMatch(forked.prompt, /STEER-LATE|Delivered late/);
+});
 
 const foreignReply = (text: string): Message =>
 	({
@@ -742,6 +888,74 @@ test("a kept failed reply with nothing to show adds no history seed", async () =
 	assert.equal(retry.prompt, "ECHO first\nECHO second");
 });
 
+/**
+ * A pending steer "ECHO same" with an image, then a request whose new user message has the same text
+ * block: the image tells the two apart in what the agent gets next.
+ */
+async function identicalSteerAndUser(handle: AcpProviderHandle): Promise<Message[]> {
+	const steer: Message = {
+		role: "user",
+		content: [
+			{ type: "text", text: "ECHO same" },
+			{ type: "image", data: "aGk=", mimeType: "image/png" },
+		],
+		timestamp: ++clock,
+	};
+	const messages = await queueSteer(handle, "MAXTOKENS work", steer);
+	const ended = await step(handle, messages);
+	assert.equal(ended.stopReason, "length");
+	messages.push(ended, user("ECHO same"));
+	return messages;
+}
+
+/** The prompt without the late note and without the first of its identical "ECHO same" blocks. */
+function withoutFirstSame(prompt: Payload["prompt"]): Payload["prompt"] {
+	const first = prompt.findIndex((block) => block.text === "ECHO same");
+	return prompt.filter((block, index) => index !== first && !/^Delivered late/.test(block.text ?? ""));
+}
+
+test("a hook that keeps one of two identical blocks leaves the removed steer pending", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await identicalSteerAndUser(handle);
+	const stripped = await capture(handle, messages, undefined, (payload) => {
+		payload.prompt.splice(0, payload.prompt.length, ...withoutFirstSame(payload.prompt));
+	});
+	assert.equal(stripped.prompt, "[image]\nECHO same");
+	assert.equal(stripped.message.stopReason, "stop");
+	messages.push(stripped.message, user("ECHO again"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\nECHO same\n\[image\]\nECHO again$/, "only the steer is sent again");
+});
+
+test("a hook that rebuilds one of two identical blocks keeps the ambiguous steer pending", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await identicalSteerAndUser(handle);
+	const rebuilt = await capture(handle, messages, undefined, (payload) => ({
+		sessionId: payload.sessionId,
+		prompt: withoutFirstSame(payload.prompt).map((block) => ({ ...block })),
+	}));
+	assert.equal(rebuilt.prompt, "[image]\nECHO same");
+	messages.push(rebuilt.message, user("ECHO again"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\nECHO same\n\[image\]\n/, "the ambiguous steer stays pending");
+	assert.doesNotMatch(next.prompt, /conversation-history/);
+});
+
+test("a user message a hook left out of an answered prompt reaches the next one as a user block", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one"), user("two")];
+	const partial = await capture(handle, messages, undefined, (payload) => {
+		payload.prompt.splice(0, payload.prompt.length, ...payload.prompt.filter((block) => block.text !== "two"));
+	});
+	assert.equal(partial.prompt, "ECHO one");
+	assert.equal(partial.message.stopReason, "stop");
+	messages.push(partial.message, user("ECHO three"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\ntwo\nECHO three$/);
+	messages.push(next.message, user("ECHO four"));
+	assert.equal((await capture(handle, messages)).prompt, "ECHO four");
+});
+
 test("a history seed a hook removed from two answered prompts reaches the third once", async () => {
 	const handle = makeProvider([agent()]);
 	const stripSeed = (payload: Payload): void => {
@@ -758,6 +972,24 @@ test("a history seed a hook removed from two answered prompts reaches the third 
 	assert.match(third.prompt, /^<conversation-history>[\s\S]*earlier question[\s\S]*FOREIGN-REPLY[\s\S]*<\/conversation-history>\nECHO three$/);
 	messages.push(third.message, user("ECHO four"));
 	assert.equal((await capture(handle, messages)).prompt, "ECHO four");
+});
+
+test("content an onPayload hook removes from the prompt is sent again with the next one", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "MAXTOKENS work");
+	const ended = await step(handle, messages);
+	assert.equal(ended.stopReason, "length");
+	messages.push(ended, user("ECHO next"));
+	const stripped = await capture(handle, messages, undefined, (payload) => {
+		const kept = payload.prompt.filter((block) => !/STEER-LATE|Delivered late/.test(block.text ?? ""));
+		payload.prompt.splice(0, payload.prompt.length, ...kept);
+	});
+	assert.equal(stripped.message.stopReason, "stop");
+	assert.equal(stripped.prompt, "ECHO next");
+	messages.push(stripped.message, user("ECHO again"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, LATE_STEER);
+	assert.match(next.prompt, /\nECHO again$/);
 });
 
 test("cache-warming requests do not reach the agent", async () => {
@@ -831,6 +1063,21 @@ test("two conversations of one agent each list, approve and call their own Pi to
 	const last = await step(handle, messages, undefined, { tools: [alpha], sessionId: "conv-a" });
 	assert.match(textOf(last), /PERM<<<allow>>> TOOLS<<<alpha>>> RESULT<<<alpha ran>>>/);
 	assert.deepEqual(asked, [], "conversation a's own tool is approved without the policy");
+});
+
+test("a pending steer stays with its conversation while a sibling conversation of the agent runs", async () => {
+	const handle = makeProvider([agent()]);
+	const conversationA = { sessionId: "conv-a" };
+	const messages: Message[] = [user("ECHO one"), user("two")];
+	const partial = await capture(handle, messages, undefined, (payload) => {
+		payload.prompt.splice(0, payload.prompt.length, ...payload.prompt.filter((block) => block.text !== "two"));
+	}, conversationA);
+	assert.equal(partial.prompt, "ECHO one");
+	const sibling = await capture(handle, [user("ECHO sibling")], undefined, undefined, { sessionId: "conv-b" });
+	assert.equal(sibling.prompt, "ECHO sibling", "the sibling conversation does not get the other one's steer");
+	messages.push(partial.message, user("ECHO three"));
+	const next = await capture(handle, messages, undefined, undefined, conversationA);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\ntwo\nECHO three$/);
 });
 
 test("after a respawn reuses a session id, a turn parked at a native tool call does not capture the new session's calls", async () => {

@@ -26,6 +26,7 @@ import {
 	parseRpcMessage,
 	parseSessionConfig,
 	parseSessionUpdate,
+	parseSteerOutcome,
 	parseStopReason,
 	type AcpAgentInfo,
 	type AcpCommand,
@@ -441,6 +442,23 @@ export class AcpClient {
 		} catch (error) {
 			this.log(`onSessionEnd failed: ${errorText(error)}`);
 		}
+	}
+
+	/**
+	 * Injects `prompt` into the running turn with the `_session/steering`
+	 * extension. `promptRequired` means no turn was running and the message
+	 * still needs a `session/prompt`.
+	 */
+	async steer(sessionId: string, prompt: unknown[], signal?: AbortSignal): Promise<"steered" | "promptRequired"> {
+		const result = await abortable(
+			this.request(
+				"_session/steering",
+				{ sessionId, prompt, _meta: { steering: { idleBehavior: "promptRequired" } } },
+				this.options.handshakeTimeoutMs,
+			),
+			signal,
+		);
+		return parseSteerOutcome(result);
 	}
 
 	/** Slash commands the newest conversation's current session advertised (`available_commands_update`). */

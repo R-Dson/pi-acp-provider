@@ -304,6 +304,8 @@ export interface AcpAgentCapabilities {
 	image: boolean;
 	/** `session/new` accepts `systemPrompt` (append mode). */
 	systemPrompt: boolean;
+	/** `_session/steering` injects a message into the running turn. */
+	steering: boolean;
 }
 
 function parseCapabilities(record: Record<string, unknown>): AcpAgentCapabilities {
@@ -311,10 +313,12 @@ function parseCapabilities(record: Record<string, unknown>): AcpAgentCapabilitie
 	const mcp = isRecord(caps.mcpCapabilities) ? caps.mcpCapabilities : {};
 	const prompt = isRecord(caps.promptCapabilities) ? caps.promptCapabilities : {};
 	const session = isRecord(caps.sessionCapabilities) ? caps.sessionCapabilities : {};
+	const meta = isRecord(record._meta) ? record._meta : {};
 	return {
 		mcpHttp: mcp.http === true,
 		image: prompt.image === true,
 		systemPrompt: isRecord(session.systemPrompt),
+		steering: isRecord(meta.steering) && meta.steering.supported === true,
 	};
 }
 
@@ -462,4 +466,9 @@ export function parsePromptUsage(result: unknown): AcpUsage | undefined {
 		cacheRead: count(usage.cachedReadTokens),
 		cacheWrite: count(usage.cachedWriteTokens),
 	};
+}
+
+/** `_session/steering` result: whether the message joined the running turn. */
+export function parseSteerOutcome(result: unknown): "steered" | "promptRequired" {
+	return isRecord(result) && result.outcome === "promptRequired" ? "promptRequired" : "steered";
 }
