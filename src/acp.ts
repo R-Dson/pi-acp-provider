@@ -318,7 +318,10 @@ export function parseSessionConfig(result: unknown, previous: AcpSessionConfig =
 	const keptModel = !hasConfigOptions || previous.model?.configId === null ? previous.model : undefined;
 	return {
 		model: findSelect(result.configOptions, "model") ?? parseLegacyModels(result.models) ?? keptModel,
-		thoughtLevel: hasConfigOptions ? findSelect(result.configOptions, "thought_level") : previous.thoughtLevel,
+		// Mistral Vibe names the category "thinking" instead of the spec's "thought_level".
+		thoughtLevel: hasConfigOptions
+			? (findSelect(result.configOptions, "thought_level") ?? findSelect(result.configOptions, "thinking"))
+			: previous.thoughtLevel,
 	};
 }
 
