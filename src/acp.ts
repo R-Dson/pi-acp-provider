@@ -78,6 +78,9 @@ export function parseRpcMessage(value: unknown): RpcIncoming | null {
 const TOOL_CALL_STATUSES = ["pending", "in_progress", "completed", "failed"] as const;
 export type ToolCallStatus = (typeof TOOL_CALL_STATUSES)[number];
 
+export const isFinalStatus = (status: ToolCallStatus | undefined): status is "completed" | "failed" =>
+	status === "completed" || status === "failed";
+
 /** The `session/update` variants the provider renders; everything else is dropped. */
 export type AcpSessionUpdate =
 	| { type: "agent_message_chunk"; text: string }
@@ -120,6 +123,8 @@ export interface AcpToolContent {
 	diffs: AcpToolDiff[];
 	terminals: string[];
 }
+
+export const emptyToolContent = (): AcpToolContent => ({ text: [], diffs: [], terminals: [] });
 
 export interface AcpToolLocation {
 	path: string;
@@ -173,7 +178,7 @@ function toolContentSummary(content: unknown): string {
 
 function parseToolContent(content: unknown): AcpToolContent | undefined {
 	if (!Array.isArray(content)) return undefined;
-	const parsed: AcpToolContent = { text: [], diffs: [], terminals: [] };
+	const parsed = emptyToolContent();
 	for (const item of content) {
 		if (!isRecord(item)) continue;
 		if (item.type === "content") {

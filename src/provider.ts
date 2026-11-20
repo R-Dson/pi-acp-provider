@@ -56,7 +56,9 @@ import {
 	RPC_METHOD_NOT_FOUND,
 	autoApprove,
 	autoReject,
+	emptyToolContent,
 	errorMessage,
+	isFinalStatus,
 	isRecord,
 	parsePermissionRequest,
 	structuredToolIdentities,
@@ -213,6 +215,10 @@ function partsIn(parts: readonly PromptPart[], payload: unknown): PromptPart[] {
 
 type TurnOutcome = { result: PromptResult } | { error: unknown; auth: AcpAgentInfo | null };
 
+/** Whether the prompt ran to the agent's `end_turn`, so the turn may take its next prompt. */
+const endedCleanly = (outcome: TurnOutcome | null): boolean =>
+	outcome !== null && "result" in outcome && outcome.result.kind === "finished" && outcome.result.stopReason === "end_turn";
+
 /** A Pi tool call the agent made over MCP, waiting for Pi's result. */
 type PiToolEvent = { type: "pi_tool_call"; id: string; name: string; arguments: Record<string, unknown> };
 type TurnEvent = AcpSessionUpdate | PiToolEvent;
@@ -267,6 +273,17 @@ interface PendingSteer {
 
 /** One key from an agent id and a conversation or session id. */
 const turnKey = (agentId: string, id: string): string => `${agentId}\u0000${id}`;
+
+interface IsolatedRequest {
+	stream: AssistantMessageEventStream;
+	writer: MessageWriter;
+	message: AssistantMessage;
+	agent: AcpAgentConfig;
+	modelId: string | undefined;
+	model: Model<Api>;
+	context: TranscriptContext;
+	streamOptions: StreamOptions;
+}
 
 interface LiveTurn {
 	/** `turnKey(agent id, Pi's StreamOptions.sessionId or "")`: the turn's slot in `lives`, `claims`, `served` and `pendingSteers`. */
@@ -355,6 +372,19 @@ interface SyncState {
 	systemPrompt: string;
 }
 
+const newSyncState = (systemPrompt: string): SyncState => ({
+	ownStamps: new Set(),
+	anchor: undefined,
+	first: undefined,
+	ours: new Set(),
+	delivered: new Set(),
+	seeded: new Set(),
+	lastStreamed: undefined,
+	shown: new Set(),
+	kept: new Set(),
+	systemPrompt,
+});
+
 /** Renders tool activity as short inline notices in the reply text. */
 function createToolRenderer(append: (text: string) => void) {
 	const titles = new Map<string, string>();
@@ -362,7 +392,7 @@ function createToolRenderer(append: (text: string) => void) {
 		if (update.title) titles.set(update.toolCallId, update.title);
 		const title = titles.get(update.toolCallId) ?? "tool";
 		if (update.type === "tool_call") append(`\n⚙️ Executing [${title}]...\n`);
-		if (update.status !== "completed" && update.status !== "failed") return;
+		if (!isFinalStatus(update.status)) return;
 		const mark = update.status === "completed" ? "✓" : "✗";
 		const summary = summarize(update.summary);
 		append(`${mark} ${title}${summary ? `: ${summary}` : ""}\n`);
@@ -490,7 +520,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const toolCall = isRecord(params) && isRecord(params.toolCall) ? params.toolCall : undefined;
 		const id = typeof toolCall?.toolCallId === "string" ? toolCall.toolCallId : undefined;
 		const entry = id === undefined ? undefined : turn.tools.get(id);
-		if (!toolCall || !entry || entry.reportedStatus === "completed" || entry.reportedStatus === "failed") return false;
+		if (!toolCall || !entry || isFinalStatus(entry.reportedStatus)) return false;
 		const tools = new Set(
 			[...structuredToolIdentities(toolCall), ...entry.identities].map((identity) =>
 				typeof identity === "string" ? (PI_TOOL_NAME.exec(identity)?.[1] ?? null) : null,
@@ -732,7 +762,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 		if (streamOptions?.cacheRetention === "none") {
-			await runIsolated(stream, writer, message, agent, target.modelId, model, context, streamOptions);
+			await runIsolated({ stream, writer, message, agent, modelId: target.modelId, model, context, streamOptions });
 			return;
 		}
 		const conversationId = streamOptions?.sessionId ?? "";
@@ -802,18 +832,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				sessionId = await acp.ensureSession({ signal: setupSignal, setup, conversation: conversationId });
 				known = undefined;
 			}
-			state = known ?? {
-				ownStamps: new Set(),
-				anchor: undefined,
-				first: undefined,
-				ours: new Set(),
-				delivered: new Set(),
-				seeded: new Set(),
-				lastStreamed: undefined,
-				shown: new Set(),
-				kept: new Set(),
-				systemPrompt: promptInSession ? systemPrompt : "",
-			};
+			state = known ?? newSyncState(promptInSession ? systemPrompt : "");
 			sync.set(turnKey(agent.id, sessionId), state);
 			keepConfirmed(state, messages);
 			info = acp.info ?? (await acp.ensureReady(setupSignal));
@@ -1052,9 +1071,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * A turn that ended otherwise drops it; its steers stay pending for the next prompt.
 	 */
 	function enqueuePrompt(turn: LiveTurn, prompt: TurnPrompt): void {
-		const finishedCleanly =
-			turn.outcome !== null && "result" in turn.outcome && turn.outcome.result.kind === "finished" && turn.outcome.result.stopReason === "end_turn";
-		if (!turn.running && finishedCleanly) {
+		if (!turn.running && endedCleanly(turn.outcome)) {
 			turn.outcome = null;
 			startPrompt(turn, prompt);
 		} else if (turn.running) turn.queued.push(prompt);
@@ -1120,7 +1137,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					reportedStatus: undefined,
 					mirrored: false,
 					piOwned: false,
-					state: { status: undefined, content: { text: [], diffs: [], terminals: [] }, rawOutput: undefined },
+					state: { status: undefined, content: emptyToolContent(), rawOutput: undefined },
 					waiters: new Set(),
 				};
 				turn.tools.set(event.toolCallId, entry);
@@ -1132,13 +1149,16 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			if (event.rawInput !== undefined) entry.rawInput = event.rawInput;
 			entry.identities.push(...event.toolIdentities);
 			if (!entry.mirrored && piToolRef(event.toolName, entry.title)) entry.piOwned = true;
-			entry.args ??= {
-				agent: turn.agent.id,
-				title: entry.title ?? "tool",
-				...(event.kind ? { kind: event.kind } : {}),
-				...(event.locations?.length ? { locations: event.locations } : {}),
-				...(compactInput(event.rawInput) !== undefined ? { input: compactInput(event.rawInput) } : {}),
-			};
+			if (!entry.args) {
+				const input = compactInput(event.rawInput);
+				entry.args = {
+					agent: turn.agent.id,
+					title: entry.title ?? "tool",
+					...(event.kind ? { kind: event.kind } : {}),
+					...(event.locations?.length ? { locations: event.locations } : {}),
+					...(input !== undefined ? { input } : {}),
+				};
+			}
 			if (entry.mirrored) notifyWaiters(entry);
 		}
 		if (turn.attached) turn.attached.consume(event);
@@ -1167,7 +1187,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		// The agent's own report of this call is shown by Pi's tool row instead.
 		for (const entry of [...turn.tools.values()].reverse()) {
-			if (entry.piOwned || entry.state.status === "completed" || entry.state.status === "failed") continue;
+			if (entry.piOwned || isFinalStatus(entry.state.status)) continue;
 			if (piToolRef(undefined, entry.title) === call.name || sameJson(entry.rawInput, call.arguments)) {
 				entry.piOwned = true;
 				break;
@@ -1176,7 +1196,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		// A mirrored row Pi is waiting on would block it from running this call, which the agent waits on.
 		for (const entry of turn.tools.values()) {
 			if (entry.waiters.size === 0) continue;
-			if (entry.piOwned) entry.state = { ...entry.state, status: "completed", content: { text: [`Handed to Pi as ${call.name}.`], diffs: [], terminals: [] } };
+			if (entry.piOwned) entry.state = { ...entry.state, status: "completed", content: { ...emptyToolContent(), text: [`Handed to Pi as ${call.name}.`] } };
 			notifyWaiters(entry, true);
 		}
 		const id = `pi_${randomUUID()}`;
@@ -1200,7 +1220,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	function notifyWaiters(entry: ToolEntry, force = false): void {
-		const final = force || entry.state.status === "completed" || entry.state.status === "failed";
+		const final = force || isFinalStatus(entry.state.status);
 		for (const waiter of [...entry.waiters]) {
 			if (final) {
 				entry.waiters.delete(waiter);
@@ -1290,8 +1310,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		turn.running = false;
 		if ("result" in outcome && outcome.result.kind === "finished") addUsage(turn.usage, outcome.result.usage, turn.contextUsed);
 		const next = turn.queued.shift();
-		const cleanEnd = "result" in outcome && outcome.result.kind === "finished" && outcome.result.stopReason === "end_turn";
-		if (next && cleanEnd && !turn.controller.signal.aborted) {
+		if (next && endedCleanly(outcome) &&!turn.controller.signal.aborted) {
 			startPrompt(turn, next);
 			return;
 		}
@@ -1309,16 +1328,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	/** Runs a request outside the conversation (a summary) in a throwaway agent process. */
-	async function runIsolated(
-		stream: AssistantMessageEventStream,
-		writer: MessageWriter,
-		message: AssistantMessage,
-		agent: AcpAgentConfig,
-		modelId: string | undefined,
-		model: Model<Api>,
-		context: TranscriptContext,
-		streamOptions: StreamOptions,
-	): Promise<void> {
+	async function runIsolated({ stream, writer, message, agent, modelId, model, context, streamOptions }: IsolatedRequest): Promise<void> {
 		const signal = streamOptions.signal;
 		const client = newClient(agent, cwd, { isolated: true });
 		try {
@@ -1365,9 +1375,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const turn = [...lives.values()].find((candidate) => candidate.mirrors.has(toolCallId));
 		const entry = turn?.mirrors.get(toolCallId);
 		if (!turn || !entry) {
-			return Promise.resolve({ status: "failed", content: { text: ["This ACP turn is no longer running."], diffs: [], terminals: [] }, rawOutput: undefined });
+			return Promise.resolve({ status: "failed", content: { ...emptyToolContent(), text: ["This ACP turn is no longer running."] }, rawOutput: undefined });
 		}
-		if (turn.outcome || entry.state.status === "completed" || entry.state.status === "failed") return Promise.resolve(entry.state);
+		if (turn.outcome || isFinalStatus(entry.state.status)) return Promise.resolve(entry.state);
 		// A Pi tool call already waits behind this row; end the row so Pi gets to it.
 		if (turn.buffer.some((event) => event.type === "pi_tool_call")) return Promise.resolve(entry.state);
 		return new Promise((resolve, reject) => {
