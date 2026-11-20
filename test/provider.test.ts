@@ -24,6 +24,11 @@ function fakeAgent(overrides: Partial<AcpAgentConfig> = {}): AcpAgentConfig {
 		args: [fakePath],
 		env: {},
 		authMethod: undefined,
+		piTools: "off",
+		mcpTransport: "stdio",
+		systemPrompt: "prompt",
+		sessionMeta: undefined,
+		ownToolsOffMeta: undefined,
 		...overrides,
 	};
 }
